@@ -4,61 +4,55 @@ const { createClient } = require('@supabase/supabase-js');
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+// Render Disk mount (ex: /var/data)
+const TOKENS_BASE_DIR = process.env.TOKENS_BASE_DIR || '/var/data';
+const TOKENS_FOLDER = process.env.TOKENS_FOLDER || 'venom-tokens';
+
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('Faltam envs SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY');
+  console.error('❌ Faltam envs: SUPABASE_URL e/ou SUPABASE_SERVICE_ROLE_KEY');
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
 const clients = new Map(); // session_key -> venom client
-const statuses = new Map(); // session_key -> status
 
 function toChatId(phone) {
-  // phone deve estar em formato 55DDDNUMERO
   const p = String(phone || '').replace(/\D/g, '');
   return `${p}@c.us`;
 }
 
-async function updateWaConnection(sessionKey, patch) {
-  await supabase.from('wa_connections').update(patch).eq('session_key', sessionKey);
+async function updateConn(session_key, patch) {
+  await supabase.from('wa_connections').update(patch).eq('session_key', session_key);
 }
 
-async function startSession(conn) {
-  const sessionKey = conn.session_key;
+async function startSession(session_key) {
+  if (clients.has(session_key)) return;
 
-  if (clients.has(sessionKey)) return;
+  console.log(`🚀 Start session: ${session_key}`);
 
-  console.log(`🚀 Iniciando sessão: ${sessionKey}`);
-
-  // create(session, catchQR, statusFind, options)
-  // Exemplo de catchQR/statusFind está no README do Venom. :contentReference[oaicite:5]{index=5}
   const client = await venom.create(
-    sessionKey,
-    async (base64Qrimg, asciiQR, attempts, urlCode) => {
-      console.log(`📲 QR (${sessionKey}) tentativas: ${attempts}`);
-      // salva QR no banco pra sua tela do Lovable mostrar
-      await updateWaConnection(sessionKey, {
+    session_key,
+    async (base64Qrimg, _asciiQR, attempts) => {
+      console.log(`📲 QR para ${session_key} (tentativa ${attempts})`);
+      await updateConn(session_key, {
         status: 'connecting',
         qr_base64: base64Qrimg,
+        last_seen: new Date().toISOString(),
       });
     },
-    async (statusSession, session) => {
-      console.log(`🔎 Status (${sessionKey}):`, statusSession);
+    async (statusSession) => {
+      console.log(`🔎 Status ${session_key}: ${statusSession}`);
 
-      statuses.set(sessionKey, statusSession);
-
-      // mapeamento simples
-      if (statusSession === 'isLogged' || statusSession === 'successChat' || statusSession === 'qrReadSuccess') {
-        await updateWaConnection(sessionKey, {
+      if (['isLogged', 'qrReadSuccess', 'successChat'].includes(statusSession)) {
+        await updateConn(session_key, {
           status: 'connected',
           qr_base64: null,
           last_seen: new Date().toISOString(),
         });
       }
 
-      if (statusSession === 'notLogged' || statusSession === 'deviceNotConnected' || statusSession === 'desconnectedMobile') {
-        await updateWaConnection(sessionKey, {
+      if (['notLogged', 'deviceNotConnected', 'desconnectedMobile'].includes(statusSession)) {
+        await updateConn(session_key, {
           status: 'disconnected',
           last_seen: new Date().toISOString(),
         });
@@ -67,24 +61,23 @@ async function startSession(conn) {
     {
       multidevice: true,
       headless: true,
-      // Em VPS linux, normalmente precisa args de sandbox
       browserArgs: ['--no-sandbox', '--disable-setuid-sandbox'],
-      // disableWelcome: true, // dependendo da versão
+
+      // Persistência de sessão/tokens (pra não pedir QR sempre)
+      // Essas opções existem em setups que usam folderNameToken/mkdirFolderToken. :contentReference[oaicite:4]{index=4}
+      mkdirFolderToken: TOKENS_BASE_DIR,
+      folderNameToken: TOKENS_FOLDER,
     }
   );
 
-  clients.set(sessionKey, client);
-  await updateWaConnection(sessionKey, { last_seen: new Date().toISOString() });
-
-  // opcional: ping pra manter last_seen
-  setInterval(() => updateWaConnection(sessionKey, { last_seen: new Date().toISOString() }).catch(() => {}), 30000);
+  clients.set(session_key, client);
+  await updateConn(session_key, { last_seen: new Date().toISOString() });
 }
 
 async function refreshSessions() {
-  // pega todas as conexões e garante que estão rodando
   const { data, error } = await supabase
     .from('wa_connections')
-    .select('id, tenant_id, label, session_key, status')
+    .select('session_key,status')
     .order('created_at', { ascending: true });
 
   if (error) {
@@ -92,20 +85,18 @@ async function refreshSessions() {
     return;
   }
 
-  for (const conn of data) {
-    // você pode filtrar por status se quiser
-    await startSession(conn).catch((e) => {
-      console.error('Erro startSession', conn.session_key, e);
-      updateWaConnection(conn.session_key, { status: 'error' }).catch(() => {});
+  for (const c of data) {
+    await startSession(c.session_key).catch(async (e) => {
+      console.error('Erro startSession:', c.session_key, e);
+      await updateConn(c.session_key, { status: 'error' });
     });
   }
 }
 
 async function processOutbox() {
-  // pega lote pequeno
   const { data, error } = await supabase
     .from('whatsapp_outbox')
-    .select('id, wa_connection_id, to_phone, message, tries, tenant_id, wa_connections(session_key)')
+    .select('id,to_phone,message,tries,wa_connections(session_key)')
     .eq('status', 'pending')
     .lt('tries', 5)
     .order('created_at', { ascending: true })
@@ -117,15 +108,13 @@ async function processOutbox() {
   }
 
   for (const row of data) {
-    const sessionKey = row.wa_connections?.session_key;
-    if (!sessionKey) continue;
+    const session_key = row.wa_connections?.session_key;
+    const client = session_key ? clients.get(session_key) : null;
 
-    const client = clients.get(sessionKey);
     if (!client) continue;
 
     try {
-      const chatId = toChatId(row.to_phone);
-      await client.sendText(chatId, row.message);
+      await client.sendText(toChatId(row.to_phone), row.message);
 
       await supabase.from('whatsapp_outbox').update({
         status: 'sent',
@@ -134,24 +123,24 @@ async function processOutbox() {
         last_error: null,
       }).eq('id', row.id);
 
-      console.log(`✅ Enviado ${row.id} via ${sessionKey}`);
+      console.log(`✅ Enviado outbox ${row.id} via ${session_key}`);
     } catch (e) {
-      const msg = String(e?.message || e);
+      const err = String(e?.message || e);
 
       await supabase.from('whatsapp_outbox').update({
-        status: 'pending', // mantém pendente pra retry
+        status: 'pending',
         tries: row.tries + 1,
-        last_error: msg,
+        last_error: err,
       }).eq('id', row.id);
 
-      console.error(`❌ Erro envio ${row.id} via ${sessionKey}:`, msg);
+      console.error(`❌ Falha envio ${row.id}: ${err}`);
     }
   }
 }
 
-// loop
 (async () => {
+  console.log('✅ Worker ON');
   await refreshSessions();
-  setInterval(refreshSessions, 15000);     // garante que novas conexões subam
-  setInterval(processOutbox, 2000);        // consome a fila
+  setInterval(refreshSessions, 15000);
+  setInterval(processOutbox, 2000);
 })();
