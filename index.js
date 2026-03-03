@@ -60,7 +60,7 @@ async function startSession(session_key) {
     },
     {
       multidevice: true,
-      headless: 'new',
+      headless: true,
       browserArgs: ['--no-sandbox', '--disable-setuid-sandbox'],
 
       // Persistência de sessão/tokens (pra não pedir QR sempre)
