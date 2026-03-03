@@ -9,9 +9,8 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",
     "venom-bot": "^5.0.0"
-  }
+  },
   "engines": {
-  "node": "20.x"
-}
-  
+    "node": "20.x"
+  }
 }
