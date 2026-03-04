@@ -9,44 +9,55 @@ const {
 const path = require("path");
 const fs = require("fs");
 
-// ENV
+// ===== ENV =====
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const TOKENS_BASE_DIR = process.env.TOKENS_BASE_DIR || "/var/data";
 const TOKENS_FOLDER = process.env.TOKENS_FOLDER || "baileys-auth";
 
-const REFRESH_SESSIONS_MS = Number(process.env.REFRESH_SESSIONS_MS || 15000);
+const REFRESH_SESSIONS_MS = Number(process.env.REFRESH_SESSIONS_MS || 5000); // era 15000
 const PROCESS_OUTBOX_MS = Number(process.env.PROCESS_OUTBOX_MS || 2000);
 const OUTBOX_BATCH = Number(process.env.OUTBOX_BATCH || 20);
 
-// Se true, valida se número tem WhatsApp antes de enviar (mais lento, mas evita “sent fake”)
+// valida se número existe no WhatsApp antes de enviar (mais lento, mas evita "sent" fake)
 const CHECK_ON_WHATSAPP = String(process.env.CHECK_ON_WHATSAPP || "true") === "true";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("❌ Missing Supabase envs: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
+  console.error("❌ Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// sessões
-const sockets = new Map(); // session_key -> sock
-const starting = new Set(); // session_key em start
-const connById = new Map(); // wa_connection_id -> { session_key, status }
+// session_key -> sock
+const sockets = new Map();
+// session_key em start
+const starting = new Set();
+// cache wa_connection_id -> session_key
+let connById = new Map();
+
+function nowIso() {
+  return new Date().toISOString();
+}
 
 function ensureDir(p) {
   if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
 }
 
-function nowIso() {
-  return new Date().toISOString();
+function rmDirSafe(p) {
+  try {
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+  } catch (e) {
+    console.warn("⚠️ rmDirSafe failed:", e?.message || e);
+  }
 }
 
 function onlyDigits(v) {
   return String(v || "").replace(/\D/g, "");
 }
 
+// normaliza BR: se vier 10/11 dígitos, prefixa 55
 function normalizeBR(phone) {
   let p = onlyDigits(phone);
   if (!p) return "";
@@ -59,7 +70,7 @@ function toJid(phone) {
   return `${p}@s.whatsapp.net`;
 }
 
-async function updateConnBySession(session_key, patch) {
+async function updateConn(session_key, patch) {
   await supabase.from("wa_connections").update(patch).eq("session_key", session_key);
 }
 
@@ -73,9 +84,9 @@ async function refreshConnectionsCache() {
     return;
   }
 
-  connById.clear();
+  connById = new Map();
   for (const row of data || []) {
-    connById.set(row.id, { session_key: row.session_key, status: row.status });
+    connById.set(row.id, row.session_key);
   }
 }
 
@@ -84,13 +95,17 @@ async function startSession(session_key) {
   if (sockets.has(session_key) || starting.has(session_key)) return;
   starting.add(session_key);
 
+  const authPath = path.join(TOKENS_BASE_DIR, TOKENS_FOLDER, session_key);
+
   try {
     console.log(`🚀 Starting session: ${session_key}`);
 
-    const authPath = path.join(TOKENS_BASE_DIR, TOKENS_FOLDER, session_key);
     ensureDir(authPath);
 
-    await updateConnBySession(session_key, { status: "connecting", last_seen: nowIso() });
+    await updateConn(session_key, {
+      status: "connecting",
+      last_seen: nowIso(),
+    });
 
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     const { version } = await fetchLatestBaileysVersion();
@@ -100,6 +115,12 @@ async function startSession(session_key) {
       auth: state,
       printQRInTerminal: false,
       syncFullHistory: false,
+
+      // ajuda estabilidade em alguns hosts
+      connectTimeoutMs: 60_000,
+      keepAliveIntervalMs: 20_000,
+      defaultQueryTimeoutMs: 60_000,
+
       browser: ["URA Connect Hub", "Chrome", "1.0"],
     });
 
@@ -112,8 +133,8 @@ async function startSession(session_key) {
       if (qr) {
         const dataUrl = await qrcode.toDataURL(qr);
         console.log(`📲 QR generated: ${session_key}`);
-        await updateConnBySession(session_key, {
-          status: "connecting",
+        await updateConn(session_key, {
+          status: "qr_ready",
           qr_base64: dataUrl,
           last_seen: nowIso(),
         });
@@ -121,7 +142,7 @@ async function startSession(session_key) {
 
       if (connection === "open") {
         console.log(`✅ Connected: ${session_key}`);
-        await updateConnBySession(session_key, {
+        await updateConn(session_key, {
           status: "connected",
           qr_base64: null,
           last_seen: nowIso(),
@@ -130,22 +151,44 @@ async function startSession(session_key) {
 
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        const reason = code ?? "unknown";
+        console.log(`⚠️ Closed: ${session_key} code=${reason}`);
 
-        console.log(`⚠️ Closed: ${session_key} code=${code} reconnect=${shouldReconnect}`);
+        // 401 = loggedOut (sessão inválida). Aqui a gente FORÇA reautenticação:
+        if (code === DisconnectReason.loggedOut) {
+          console.log(`🧹 Session logged out. Clearing creds and forcing new QR: ${session_key}`);
 
-        await updateConnBySession(session_key, {
-          status: shouldReconnect ? "disconnected" : "logged_out",
+          // limpa credenciais
+          rmDirSafe(authPath);
+          ensureDir(authPath);
+
+          await updateConn(session_key, {
+            status: "logged_out",
+            qr_base64: null,
+            last_seen: nowIso(),
+          });
+
+          sockets.delete(session_key);
+
+          // tenta recomeçar pra gerar QR de novo
+          setTimeout(() => startSession(session_key), 2000);
+          return;
+        }
+
+        // outros motivos: tenta reconectar
+        await updateConn(session_key, {
+          status: "disconnected",
           last_seen: nowIso(),
         });
 
         sockets.delete(session_key);
-        if (shouldReconnect) setTimeout(() => startSession(session_key), 5000);
+        setTimeout(() => startSession(session_key), 5000);
       }
     });
   } catch (err) {
-    console.error("❌ startSession error:", err?.message || err);
-    await updateConnBySession(session_key, { status: "error", last_seen: nowIso() });
+    console.error(`❌ startSession error (${session_key}):`, err?.message || err);
+    await updateConn(session_key, { status: "error", last_seen: nowIso() });
+    sockets.delete(session_key);
   } finally {
     starting.delete(session_key);
   }
@@ -154,30 +197,26 @@ async function startSession(session_key) {
 async function refreshSessions() {
   await refreshConnectionsCache();
 
-  for (const { session_key } of connById.values()) {
+  // inicia todas que existirem no banco
+  for (const session_key of connById.values()) {
     await startSession(session_key);
   }
 
-  // heartbeat: atualiza last_seen das conectadas
+  // heartbeat das conectadas
   for (const [session_key, sock] of sockets.entries()) {
-    if (sock?.user) {
-      updateConnBySession(session_key, { last_seen: nowIso() }).catch(() => {});
-    }
+    if (sock?.user) updateConn(session_key, { last_seen: nowIso() }).catch(() => {});
   }
 }
 
-// tenta “claim” via RPC; se não existir, faz fallback simples
 async function claimOutbox(limit) {
-  // 1) RPC (recomendado)
+  // opcional: se você criou a RPC claim_whatsapp_outbox, ela fica atômica
   const { data: claimed, error: rpcErr } = await supabase.rpc("claim_whatsapp_outbox", {
     p_limit: limit,
   });
 
   if (!rpcErr && claimed) return claimed;
 
-  // 2) Fallback (não-atômico, mas funciona com 1 worker)
-  if (rpcErr) console.warn("⚠️ claim_whatsapp_outbox RPC not available, using fallback:", rpcErr.message);
-
+  // fallback simples (1 worker)
   const { data, error } = await supabase
     .from("whatsapp_outbox")
     .select("id,to_phone,message,tries,wa_connection_id")
@@ -187,41 +226,32 @@ async function claimOutbox(limit) {
     .limit(limit);
 
   if (error) {
-    console.error("❌ fallback outbox select error:", error.message);
+    console.error("❌ outbox select error:", error.message);
     return [];
   }
 
-  // marca como sending + incrementa tries
   const ids = (data || []).map((r) => r.id);
   if (ids.length) {
-    await supabase
-      .from("whatsapp_outbox")
-      .update({ status: "sending" })
-      .in("id", ids);
+    await supabase.from("whatsapp_outbox").update({ status: "sending" }).in("id", ids);
   }
 
-  // increment tries individualmente na hora de finalizar envio (pra não duplicar lógica)
   return data || [];
 }
 
 async function processOutbox() {
-  const claimed = await claimOutbox(OUTBOX_BATCH);
-  if (!claimed.length) return;
+  const rows = await claimOutbox(OUTBOX_BATCH);
+  if (!rows.length) return;
 
-  console.log(`📦 Outbox claimed: ${claimed.length}`);
+  console.log(`📦 Outbox claimed: ${rows.length}`);
 
-  for (const row of claimed) {
-    const conn = connById.get(row.wa_connection_id);
-    const session_key = conn?.session_key;
+  for (const row of rows) {
+    const session_key = connById.get(row.wa_connection_id);
     const sock = session_key ? sockets.get(session_key) : null;
 
     if (!session_key || !sock) {
       await supabase
         .from("whatsapp_outbox")
-        .update({
-          status: "pending",
-          last_error: "no_socket_for_connection",
-        })
+        .update({ status: "pending", last_error: "no_socket_for_connection" })
         .eq("id", row.id);
       continue;
     }
@@ -230,10 +260,7 @@ async function processOutbox() {
     if (!phone) {
       await supabase
         .from("whatsapp_outbox")
-        .update({
-          status: "error",
-          last_error: "invalid_phone",
-        })
+        .update({ status: "error", last_error: "invalid_phone" })
         .eq("id", row.id);
       continue;
     }
@@ -244,46 +271,35 @@ async function processOutbox() {
         if (!check?.[0]?.exists) {
           await supabase
             .from("whatsapp_outbox")
-            .update({
-              status: "error",
-              last_error: "number_not_on_whatsapp",
-            })
+            .update({ status: "error", last_error: "number_not_on_whatsapp" })
             .eq("id", row.id);
           continue;
         }
       }
 
-      const jid = toJid(phone);
-      const sentMsg = await sock.sendMessage(jid, { text: row.message });
+      await sock.sendMessage(toJid(phone), { text: row.message });
 
-      // marca como sent
-      const patch = {
-        status: "sent",
-        sent_at: nowIso(),
-        last_error: null,
-      };
-
-      // se existir coluna wa_message_id, salva (se não existir, supabase vai ignorar? não, vai dar erro)
-      // então só salva se você criar a coluna.
-      // patch.wa_message_id = sentMsg?.key?.id || null;
-
-      await supabase.from("whatsapp_outbox").update(patch).eq("id", row.id);
+      await supabase
+        .from("whatsapp_outbox")
+        .update({
+          status: "sent",
+          sent_at: nowIso(),
+          last_error: null,
+          tries: (row.tries || 0) + 1,
+        })
+        .eq("id", row.id);
 
       console.log(`✅ Sent outbox=${row.id} to=${phone} session=${session_key}`);
     } catch (e) {
       const msg = String(e?.message || e || "send_failed");
       console.error(`❌ Send failed outbox=${row.id}:`, msg);
 
-      // se ainda tem tentativas, volta pra pending; senão vira error
       const tries = (row.tries || 0) + 1;
       const status = tries >= 5 ? "error" : "pending";
 
       await supabase
         .from("whatsapp_outbox")
-        .update({
-          status,
-          last_error: msg,
-        })
+        .update({ status, tries, last_error: msg })
         .eq("id", row.id);
     }
   }
