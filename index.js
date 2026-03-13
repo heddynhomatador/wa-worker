@@ -23,6 +23,10 @@ const CHECK_ON_WHATSAPP =
   String(process.env.CHECK_ON_WHATSAPP || "true") === "true";
 const MAX_OUTBOX_TRIES = Number(process.env.MAX_OUTBOX_TRIES || 5);
 
+const QR_RETRY_MS = Number(process.env.QR_RETRY_MS || 60000);
+const QR_MAX_RESTARTS = Number(process.env.QR_MAX_RESTARTS || 3);
+const STATUS_SLEEPING = "sleeping";
+
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("❌ Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
@@ -35,8 +39,9 @@ const sockets = new Map(); // session_key -> sock
 const starting = new Set();
 const intentionalStops = new Set();
 const restartTimers = new Map();
+const qrRestartCounts = new Map();
 
-let connections = []; // cache de wa_connections
+let connections = [];
 let refreshingSessions = false;
 let processingOutbox = false;
 
@@ -87,6 +92,16 @@ function clearRestartTimer(session_key) {
     clearTimeout(t);
     restartTimers.delete(session_key);
   }
+}
+
+function incQrRestart(session_key) {
+  const next = (qrRestartCounts.get(session_key) || 0) + 1;
+  qrRestartCounts.set(session_key, next);
+  return next;
+}
+
+function resetQrRestart(session_key) {
+  qrRestartCounts.delete(session_key);
 }
 
 async function getConnectionBySessionKey(session_key) {
@@ -151,11 +166,16 @@ function scheduleRestart(session_key, delayMs, reason) {
       return;
     }
 
-    const exists = await sessionExistsInDb(session_key);
-    if (!exists) {
+    const row = await getConnectionBySessionKey(session_key);
+    if (!row) {
       console.log(
         `🚫 Restart skipped, session no longer exists in DB: ${session_key}`
       );
+      return;
+    }
+
+    if (row.status === STATUS_SLEEPING) {
+      console.log(`😴 Restart skipped, session is sleeping: ${session_key}`);
       return;
     }
 
@@ -186,6 +206,7 @@ async function stopSession(
   }
 
   clearRestartTimer(session_key);
+  resetQrRestart(session_key);
 
   console.log(
     `⏹️ stopSession session=${session_key} reason=${reason} clearCreds=${clearCreds} doLogout=${doLogout}`
@@ -234,9 +255,14 @@ async function startSession(session_key) {
   if (!session_key) return;
   if (sockets.has(session_key) || starting.has(session_key)) return;
 
-  const exists = await sessionExistsInDb(session_key);
-  if (!exists) {
+  const row = await getConnectionBySessionKey(session_key);
+  if (!row) {
     console.log(`🚫 startSession ignored, session not found in DB: ${session_key}`);
+    return;
+  }
+
+  if (row.status === STATUS_SLEEPING) {
+    console.log(`😴 startSession ignored, session is sleeping: ${session_key}`);
     return;
   }
 
@@ -283,6 +309,7 @@ async function startSession(session_key) {
         if (qr) {
           const dataUrl = await qrcode.toDataURL(qr);
           console.log(`📲 QR generated: ${session_key}`);
+
           await safeUpdateConn(session_key, {
             status: "qr_ready",
             qr_base64: dataUrl,
@@ -292,7 +319,9 @@ async function startSession(session_key) {
 
         if (connection === "open") {
           console.log(`✅ Connected: ${session_key}`);
+          resetQrRestart(session_key);
           intentionalStops.delete(session_key);
+
           await safeUpdateConn(session_key, {
             status: "connected",
             qr_base64: null,
@@ -321,6 +350,7 @@ async function startSession(session_key) {
 
           if (code === DisconnectReason.loggedOut) {
             console.log(`🧹 loggedOut detected. Clearing creds: ${session_key}`);
+            resetQrRestart(session_key);
             rmDirSafe(authPath);
             ensureDir(path.dirname(authPath));
 
@@ -334,8 +364,35 @@ async function startSession(session_key) {
             return;
           }
 
+          if (code === 408) {
+            const attempts = incQrRestart(session_key);
+
+            if (attempts >= QR_MAX_RESTARTS) {
+              await safeUpdateConn(session_key, {
+                status: STATUS_SLEEPING,
+                qr_base64: null,
+                last_seen: nowIso(),
+              });
+
+              console.log(
+                `😴 Session moved to sleeping after ${attempts} QR retries: ${session_key}`
+              );
+              return;
+            }
+
+            await safeUpdateConn(session_key, {
+              status: "qr_ready",
+              qr_base64: null,
+              last_seen: nowIso(),
+            });
+
+            scheduleRestart(session_key, QR_RETRY_MS, `qr_retry_${attempts}`);
+            return;
+          }
+
           await safeUpdateConn(session_key, {
             status: "disconnected",
+            qr_base64: null,
             last_seen: nowIso(),
           });
 
@@ -350,7 +407,10 @@ async function startSession(session_key) {
     });
   } catch (err) {
     console.error(`❌ startSession error (${session_key}):`, err?.message || err);
-    await safeUpdateConn(session_key, { status: "error", last_seen: nowIso() });
+    await safeUpdateConn(session_key, {
+      status: "error",
+      last_seen: nowIso(),
+    });
     sockets.delete(session_key);
   } finally {
     starting.delete(session_key);
@@ -384,6 +444,11 @@ async function refreshSessions() {
 
     for (const c of connections) {
       if (!c?.session_key) continue;
+
+      if (c.status === STATUS_SLEEPING) {
+        clearRestartTimer(c.session_key);
+        continue;
+      }
 
       if (c.status === "logged_out") {
         console.log(`🔁 Manual reset requested (status=logged_out): ${c.session_key}`);
@@ -505,11 +570,23 @@ async function processOutbox() {
         }
 
         if (!sock) {
+          const lastError =
+            conn.status === STATUS_SLEEPING
+              ? "wa_connection_sleeping"
+              : "no_socket_for_connection";
+
           await supabase
             .from("whatsapp_outbox")
-            .update({ status: "pending", last_error: "no_socket_for_connection" })
+            .update({ status: "pending", last_error: lastError })
             .eq("id", row.id);
-          console.log(`⚠️ no_socket_for_connection outbox=${row.id} session=${session_key}`);
+
+          if (conn.status !== STATUS_SLEEPING && conn.status !== "logged_out") {
+            startSession(session_key).catch(() => {});
+          }
+
+          console.log(
+            `⚠️ no_socket_for_connection outbox=${row.id} session=${session_key} status=${conn.status}`
+          );
           continue;
         }
 
@@ -586,7 +663,7 @@ async function bootstrap() {
 
     console.log("🔥 Baileys Worker Running");
     console.log(
-      `ℹ️ config TOKENS_BASE_DIR=${TOKENS_BASE_DIR} TOKENS_FOLDER=${TOKENS_FOLDER} REFRESH_SESSIONS_MS=${REFRESH_SESSIONS_MS} PROCESS_OUTBOX_MS=${PROCESS_OUTBOX_MS} CHECK_ON_WHATSAPP=${CHECK_ON_WHATSAPP}`
+      `ℹ️ config TOKENS_BASE_DIR=${TOKENS_BASE_DIR} TOKENS_FOLDER=${TOKENS_FOLDER} REFRESH_SESSIONS_MS=${REFRESH_SESSIONS_MS} PROCESS_OUTBOX_MS=${PROCESS_OUTBOX_MS} CHECK_ON_WHATSAPP=${CHECK_ON_WHATSAPP} QR_RETRY_MS=${QR_RETRY_MS} QR_MAX_RESTARTS=${QR_MAX_RESTARTS}`
     );
 
     await refreshSessions();
