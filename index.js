@@ -11,12 +11,15 @@ const {
 } = require("@whiskeysockets/baileys");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const TOKENS_BASE_DIR = process.env.TOKENS_BASE_DIR || "/var/data";
 const TOKENS_FOLDER = process.env.TOKENS_FOLDER || "baileys-auth";
+
 const REFRESH_SESSIONS_MS = Number(process.env.REFRESH_SESSIONS_MS || 10000);
 const PROCESS_OUTBOX_MS = Number(process.env.PROCESS_OUTBOX_MS || 3000);
 const OUTBOX_BATCH = Number(process.env.OUTBOX_BATCH || 20);
@@ -24,17 +27,28 @@ const CHECK_ON_WHATSAPP = String(process.env.CHECK_ON_WHATSAPP || "true") === "t
 const MAX_OUTBOX_TRIES = Number(process.env.MAX_OUTBOX_TRIES || 5);
 const SENDING_STALE_MINUTES = Number(process.env.SENDING_STALE_MINUTES || 30);
 const UNCONFIRMED_AFTER_MINUTES = Number(process.env.UNCONFIRMED_AFTER_MINUTES || 5);
+const AUTO_RETRY_UNCONFIRMED = String(process.env.AUTO_RETRY_UNCONFIRMED || "false") === "true";
+const UNCONFIRMED_RETRY_AFTER_MINUTES = Number(process.env.UNCONFIRMED_RETRY_AFTER_MINUTES || 15);
 const SESSION_WARMUP_SECONDS = Number(process.env.SESSION_WARMUP_SECONDS || 15);
 const UNHEALTHY_COOLDOWN_SECONDS = Number(process.env.UNHEALTHY_COOLDOWN_SECONDS || 120);
+const WORKER_INSTANCE_ID = process.env.WORKER_INSTANCE_ID ||
+  `${os.hostname()}-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+const WORKER_LOCK_TTL_SECONDS = Number(process.env.WORKER_LOCK_TTL_SECONDS || 60);
+const SESSION_SEND_CONCURRENCY = Number(process.env.SESSION_SEND_CONCURRENCY || 1);
+const CLEAN_ORPHAN_TOKENS = String(process.env.CLEAN_ORPHAN_TOKENS || "false") === "true";
+const ORPHAN_TOKEN_SCAN_MS = Number(process.env.ORPHAN_TOKEN_SCAN_MS || 300000);
+
 const QR_RETRY_MS = Number(process.env.QR_RETRY_MS || 60000);
 const QR_MAX_RESTARTS = Number(process.env.QR_MAX_RESTARTS || 3);
 const CLOSE_RETRY_MS = Number(process.env.CLOSE_RETRY_MS || 15000);
 const CLOSE_MAX_RESTARTS = Number(process.env.CLOSE_MAX_RESTARTS || 5);
-
 const STATUS_SLEEPING = "sleeping";
-const NIL_UUID = "00000000-0000-0000-0000-000000000000";
+const CONNECTION_ERROR_WINDOW_SECONDS = Number(process.env.CONNECTION_ERROR_WINDOW_SECONDS || 300);
+const CONNECTION_ERROR_SLEEP_THRESHOLD = Number(process.env.CONNECTION_ERROR_SLEEP_THRESHOLD || 5);
+
 const HEALTH_ERROR_RE = /(408|500|503|timed out|timeout|messagecountererror|stream:error|stream errored)/i;
 const UNHEALTHY_CLOSE_CODES = new Set([408, 500, 503]);
+const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("missing_required_env SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY");
@@ -52,10 +66,16 @@ const closeRestartCounts = new Map();
 const connectedAt = new Map();
 const unhealthyUntil = new Map();
 const unhealthyReason = new Map();
+const sessionQueues = new Map();
+const connectionErrorHistory = new Map();
 
 let connections = [];
 let refreshingSessions = false;
 let processingOutbox = false;
+let workerLockAcquired = false;
+let workerLockRpcAvailable = true;
+let lastOrphanTokenScanAt = 0;
+let shuttingDown = false;
 let claimRpcAvailable = true;
 let resetStaleRpcAvailable = true;
 let markUnconfirmedRpcAvailable = true;
@@ -74,6 +94,11 @@ function warn(event, fields = {}) {
 
 function errorLog(event, fields = {}) {
   console.error(JSON.stringify({ event, time: nowIso(), ...fields }));
+}
+
+function safeDetails(details) {
+  if (!details || typeof details !== "object") return {};
+  return details;
 }
 
 function ensureDir(dir) {
@@ -97,11 +122,18 @@ function onlyDigits(value) {
 }
 
 function normalizeBRPhone(value) {
-  let phone = onlyDigits(value);
+  const phone = onlyDigits(value);
   if (!phone) return "";
-  if (!phone.startsWith("55") && (phone.length === 10 || phone.length === 11)) phone = `55${phone}`;
-  if (phone.startsWith("550")) phone = `55${phone.slice(3)}`;
-  return phone;
+
+  if (phone.startsWith("55")) {
+    return phone.length === 12 || phone.length === 13 ? phone : "";
+  }
+
+  if (phone.length === 10 || phone.length === 11) {
+    return `55${phone}`;
+  }
+
+  return "";
 }
 
 function buildBrazilPhoneVariants(phone) {
@@ -109,16 +141,23 @@ function buildBrazilPhoneVariants(phone) {
   const normalized = normalizeBRPhone(phone);
   const variants = new Set();
 
-  if (raw) variants.add(raw);
-  if (normalized) variants.add(normalized);
+  if (!normalized) return [];
 
-  const base = normalized || raw;
+  if (raw) variants.add(raw);
+  variants.add(normalized);
+
+  const base = normalized;
   if (base.startsWith("55")) {
     const ddd = base.slice(2, 4);
     const local = base.slice(4);
 
-    if (ddd.length === 2 && local.length === 8) variants.add(`55${ddd}9${local}`);
-    if (ddd.length === 2 && local.length === 9 && local.startsWith("9")) variants.add(`55${ddd}${local.slice(1)}`);
+    if (ddd.length === 2 && local.length === 8) {
+      variants.add(`55${ddd}9${local}`);
+    }
+
+    if (ddd.length === 2 && local.length === 9 && local.startsWith("9")) {
+      variants.add(`55${ddd}${local.slice(1)}`);
+    }
   }
 
   return Array.from(variants).filter(Boolean);
@@ -164,7 +203,9 @@ function resetCounters(sessionKey) {
 
 function markUnhealthy(sessionKey, reason) {
   if (!sessionKey) return;
-  unhealthyUntil.set(sessionKey, Date.now() + UNHEALTHY_COOLDOWN_SECONDS * 1000);
+
+  const until = Date.now() + UNHEALTHY_COOLDOWN_SECONDS * 1000;
+  unhealthyUntil.set(sessionKey, until);
   unhealthyReason.set(sessionKey, String(reason || "unknown"));
 }
 
@@ -173,8 +214,40 @@ function markUnhealthyFromError(sessionKey, err) {
   if (HEALTH_ERROR_RE.test(msg)) markUnhealthy(sessionKey, msg);
 }
 
+async function registerConnectionError(sessionKey, reason, details = {}) {
+  if (!sessionKey) return;
+
+  const textReason = String(reason || "unknown_error");
+  if (HEALTH_ERROR_RE.test(textReason)) {
+    markUnhealthy(sessionKey, textReason);
+  }
+
+  const now = Date.now();
+  const windowMs = CONNECTION_ERROR_WINDOW_SECONDS * 1000;
+  const history = (connectionErrorHistory.get(sessionKey) || [])
+    .filter((timestamp) => now - timestamp < windowMs);
+  history.push(now);
+  connectionErrorHistory.set(sessionKey, history);
+
+  const conn = await getConnectionBySessionKey(sessionKey);
+  const healthEvent = /messagecountererror/i.test(textReason) ? "message_counter_error" : "stream_error";
+  if (healthEvent === "message_counter_error") {
+    log("session_reset_required", { session_key: sessionKey, reason: textReason });
+  }
+  await recordHealthLog(conn || { session_key: sessionKey }, healthEvent, textReason, {
+    ...safeDetails(details),
+    errors_in_window: history.length,
+    window_seconds: CONNECTION_ERROR_WINDOW_SECONDS,
+  });
+
+  if (history.length >= CONNECTION_ERROR_SLEEP_THRESHOLD) {
+    await markSleeping(sessionKey, `too_many_recent_errors:${textReason.slice(0, 120)}`);
+  }
+}
+
 function unhealthyRemainingMs(sessionKey) {
-  return Math.max(0, (unhealthyUntil.get(sessionKey) || 0) - Date.now());
+  const until = unhealthyUntil.get(sessionKey) || 0;
+  return Math.max(0, until - Date.now());
 }
 
 async function getConnectionBySessionKey(sessionKey) {
@@ -207,6 +280,82 @@ async function safeUpdateConn(sessionKey, patch) {
   return true;
 }
 
+async function recordHealthLog(connOrFields, event, reason = null, details = {}) {
+  const row = connOrFields || {};
+  const payload = {
+    p_tenant_id: row.tenant_id || null,
+    p_wa_connection_id: row.id || row.wa_connection_id || null,
+    p_session_key: row.session_key || null,
+    p_event: event,
+    p_reason: reason,
+    p_details: safeDetails(details),
+  };
+
+  const { error } = await supabase.rpc("insert_wa_connection_health_log", payload);
+  if (error && !isMissingRpc(error, "insert_wa_connection_health_log")) {
+    warn("health_log_insert_failed", {
+      event,
+      session_key: payload.p_session_key,
+      error: error.message,
+    });
+  }
+}
+
+async function stopSessionsBecauseLockLost() {
+  for (const sessionKey of Array.from(sockets.keys())) {
+    await stopSession(sessionKey, {
+      clearCreds: false,
+      doLogout: false,
+      markIntentional: true,
+      reason: "worker_lock_lost",
+    });
+  }
+}
+
+async function ensureWorkerLock() {
+  if (!workerLockRpcAvailable) {
+    if (workerLockAcquired) await stopSessionsBecauseLockLost();
+    workerLockAcquired = false;
+    log("worker_lock_not_acquired", {
+      instance_id: WORKER_INSTANCE_ID,
+      reason: "try_acquire_wa_worker_lock_rpc_missing",
+    });
+    return false;
+  }
+
+  const { data, error } = await supabase.rpc("try_acquire_wa_worker_lock", {
+    p_instance_id: WORKER_INSTANCE_ID,
+    p_ttl_seconds: WORKER_LOCK_TTL_SECONDS,
+  });
+
+  if (error) {
+    if (isMissingRpc(error, "try_acquire_wa_worker_lock")) {
+      workerLockRpcAvailable = false;
+    }
+
+    if (workerLockAcquired) await stopSessionsBecauseLockLost();
+    workerLockAcquired = false;
+    log("worker_lock_not_acquired", {
+      instance_id: WORKER_INSTANCE_ID,
+      reason: error.message,
+    });
+    return false;
+  }
+
+  const acquired = data === true;
+  if (acquired && !workerLockAcquired) {
+    log("worker_lock_acquired", { instance_id: WORKER_INSTANCE_ID });
+  }
+
+  if (!acquired) {
+    if (workerLockAcquired) await stopSessionsBecauseLockLost();
+    log("worker_lock_not_acquired", { instance_id: WORKER_INSTANCE_ID });
+  }
+
+  workerLockAcquired = acquired;
+  return acquired;
+}
+
 async function refreshConnectionsCache() {
   const { data, error } = await supabase
     .from("wa_connections")
@@ -220,6 +369,51 @@ async function refreshConnectionsCache() {
   }
 
   connections = data || [];
+}
+
+function isSafeChildPath(parent, child) {
+  const parentPath = path.resolve(parent);
+  const childPath = path.resolve(child);
+  return childPath.startsWith(`${parentPath}${path.sep}`);
+}
+
+async function scanOrphanTokenFolders(force = false) {
+  const now = Date.now();
+  if (!force && now - lastOrphanTokenScanAt < ORPHAN_TOKEN_SCAN_MS) return;
+  lastOrphanTokenScanAt = now;
+
+  const authRoot = path.join(TOKENS_BASE_DIR, TOKENS_FOLDER);
+  ensureDir(authRoot);
+
+  const activeKeys = new Set(
+    connections
+      .filter((connection) => connection && connection.session_key && !connection.deleted_at)
+      .map((connection) => connection.session_key),
+  );
+
+  let entries = [];
+  try {
+    entries = fs.readdirSync(authRoot, { withFileTypes: true });
+  } catch (err) {
+    warn("orphan_token_scan_failed", { dir: authRoot, error: String(err && err.message ? err.message : err) });
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (activeKeys.has(entry.name)) continue;
+
+    const folder = path.join(authRoot, entry.name);
+    log("orphan_token_folder_detected", {
+      session_key: entry.name,
+      folder,
+      clean_orphan_tokens: CLEAN_ORPHAN_TOKENS,
+    });
+
+    if (CLEAN_ORPHAN_TOKENS && isSafeChildPath(authRoot, folder)) {
+      rmDirSafe(folder);
+    }
+  }
 }
 
 async function updateConnectedIdentity(sessionKey, sock) {
@@ -244,6 +438,14 @@ async function updateConnectedIdentity(sessionKey, sock) {
   });
 
   log("connected", { session_key: sessionKey, phone_number: phone || null, wa_jid: rawJid || null });
+
+  const row = await getConnectionBySessionKey(sessionKey);
+  if (row) {
+    await recordHealthLog(row, "connected", null, {
+      phone_number: phone || null,
+      wa_jid: rawJid || null,
+    });
+  }
 }
 
 async function markSleeping(sessionKey, reason) {
@@ -254,7 +456,10 @@ async function markSleeping(sessionKey, reason) {
     status_reason: reason,
   });
 
-  log("disconnected", { session_key: sessionKey, status: STATUS_SLEEPING, reason });
+  log("session_sleeping", { session_key: sessionKey, status: STATUS_SLEEPING, reason });
+
+  const row = await getConnectionBySessionKey(sessionKey);
+  await recordHealthLog(row || { session_key: sessionKey }, "sleeping", reason);
 }
 
 function scheduleRestart(sessionKey, delayMs, reason) {
@@ -281,7 +486,10 @@ function scheduleRestart(sessionKey, delayMs, reason) {
   log("restart_scheduled", { session_key: sessionKey, delay_ms: delayMs, reason });
 }
 
-async function stopSession(sessionKey, { clearCreds = false, doLogout = true, markIntentional = true, reason = "manual_stop" } = {}) {
+async function stopSession(
+  sessionKey,
+  { clearCreds = false, doLogout = true, markIntentional = true, reason = "manual_stop" } = {},
+) {
   const sock = sockets.get(sessionKey);
 
   if (markIntentional) intentionalStops.add(sessionKey);
@@ -360,21 +568,18 @@ async function startSession(sessionKey) {
 
     sockets.set(sessionKey, sock);
     sock.ev.on("creds.update", saveCreds);
-
     sock.ev.on("messages.update", (updates) => {
       handleMessagesUpdate(updates).catch((err) => {
         markUnhealthyFromError(sessionKey, err);
         errorLog("messages_update_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
       });
     });
-
     sock.ev.on("message-receipt.update", (updates) => {
       handleMessageReceiptUpdate(updates).catch((err) => {
         markUnhealthyFromError(sessionKey, err);
         errorLog("message_receipt_update_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
       });
     });
-
     sock.ev.on("connection.update", (update) => {
       handleConnectionUpdate(sessionKey, authPath, sock, update).catch((err) => {
         markUnhealthyFromError(sessionKey, err);
@@ -384,13 +589,11 @@ async function startSession(sessionKey) {
   } catch (err) {
     markUnhealthyFromError(sessionKey, err);
     sockets.delete(sessionKey);
-
     await safeUpdateConn(sessionKey, {
       status: "error",
       last_seen: nowIso(),
       status_reason: String(err && err.message ? err.message : err),
     });
-
     errorLog("start_session_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
   } finally {
     starting.delete(sessionKey);
@@ -408,15 +611,16 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
 
   if (qr) {
     const dataUrl = await qrcode.toDataURL(qr);
-
     await safeUpdateConn(sessionKey, {
       status: "qr_ready",
       qr_base64: dataUrl,
       last_seen: nowIso(),
       status_reason: "scan_qr_to_connect",
     });
-
     log("qr_ready", { session_key: sessionKey });
+
+    const row = await getConnectionBySessionKey(sessionKey);
+    await recordHealthLog(row || { session_key: sessionKey }, "qr_ready", "scan_qr_to_connect");
   }
 
   if (connection === "open") {
@@ -432,9 +636,17 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   starting.delete(sessionKey);
   connectedAt.delete(sessionKey);
 
-  if (code && UNHEALTHY_CLOSE_CODES.has(Number(code))) markUnhealthy(sessionKey, `close_${code}`);
+  if (code && UNHEALTHY_CLOSE_CODES.has(Number(code))) {
+    markUnhealthy(sessionKey, `close_${code}`);
+    await registerConnectionError(sessionKey, `close_${code}`, { source: "connection.update" });
+  }
 
   log("disconnected", { session_key: sessionKey, code: code || null });
+
+  const disconnectedRow = await getConnectionBySessionKey(sessionKey);
+  await recordHealthLog(disconnectedRow || { session_key: sessionKey }, "disconnected", reason, {
+    code: code || null,
+  });
 
   if (intentionalStops.has(sessionKey)) {
     intentionalStops.delete(sessionKey);
@@ -442,12 +654,14 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   }
 
   const stillActive = await getConnectionBySessionKey(sessionKey);
-  if (!stillActive || stillActive.deleted_at) return;
+  if (!stillActive || stillActive.deleted_at || stillActive.status === STATUS_SLEEPING) return;
 
   if (code === DisconnectReason.loggedOut) {
     resetCounters(sessionKey);
     rmDirSafe(authPath);
     ensureDir(path.dirname(authPath));
+
+    log("session_reset_required", { session_key: sessionKey, reason: "logged_out_on_whatsapp" });
 
     await safeUpdateConn(sessionKey, {
       status: "logged_out",
@@ -488,7 +702,6 @@ async function handleMessagesUpdate(updates) {
     if (!messageId || !fromMe || statusValue == null) continue;
 
     const ack = ackName(statusValue);
-
     if (ack === "delivered") {
       await updateOutboxAck(messageId, {
         status: "delivered",
@@ -563,15 +776,19 @@ async function updateOutboxAck(messageId, patch, eventName) {
     return;
   }
 
-  for (const row of data || []) log(eventName, { outbox_id: row.id, message_id: messageId });
+  for (const row of data || []) {
+    log(eventName, { outbox_id: row.id, message_id: messageId });
+  }
 }
 
 async function refreshSessions() {
+  if (!(await ensureWorkerLock())) return;
   if (refreshingSessions) return;
   refreshingSessions = true;
 
   try {
     await refreshConnectionsCache();
+    await scanOrphanTokenFolders();
     const activeKeys = new Set(connections.map((connection) => connection.session_key));
 
     for (const sessionKey of Array.from(sockets.keys())) {
@@ -607,7 +824,9 @@ async function refreshSessions() {
     }
 
     for (const [sessionKey, sock] of sockets.entries()) {
-      if (sock && sock.user) safeUpdateConn(sessionKey, { last_seen: nowIso() }).catch(() => {});
+      if (sock && sock.user) {
+        safeUpdateConn(sessionKey, { last_seen: nowIso() }).catch(() => {});
+      }
     }
   } catch (err) {
     errorLog("refresh_sessions_failed", { error: String(err && err.message ? err.message : err) });
@@ -657,6 +876,66 @@ async function markUnconfirmedOutbox() {
   if (count > 0) log("outbox_unconfirmed", { count });
 }
 
+async function retryUnconfirmedOutbox() {
+  if (!AUTO_RETRY_UNCONFIRMED || UNCONFIRMED_RETRY_AFTER_MINUTES <= 0) return;
+
+  const cutoff = new Date(Date.now() - UNCONFIRMED_RETRY_AFTER_MINUTES * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from("whatsapp_outbox")
+    .select("*")
+    .eq("status", "unconfirmed")
+    .lt("updated_at", cutoff)
+    .order("updated_at", { ascending: true })
+    .limit(Math.max(1, Math.min(OUTBOX_BATCH, 20)));
+
+  if (error) {
+    warn("retry_unconfirmed_select_failed", { error: error.message });
+    return;
+  }
+
+  for (const row of data || []) {
+    if (String(row.last_error || "").startsWith("retry_created:")) continue;
+
+    const fallbacks = await listTenantConnectedConnections(row.tenant_id, row.wa_connection_id);
+    const fallback = fallbacks.find((candidate) => checkConnectionHealth(candidate).ok) || null;
+    if (!fallback) continue;
+
+    const { data: inserted, error: insertError } = await supabase
+      .from("whatsapp_outbox")
+      .insert({
+        tenant_id: row.tenant_id,
+        event_id: row.event_id,
+        wa_connection_id: fallback.id,
+        to_phone: row.to_phone,
+        message: row.message,
+        status: "pending",
+        tries: 0,
+        wa_connection_label: fallback.label || null,
+        flow_key: row.flow_key || null,
+        last_error: `retry_from_unconfirmed:${row.id}`,
+        connection_snapshot: connectionSnapshot(fallback),
+      })
+      .select("id")
+      .single();
+
+    if (insertError) {
+      warn("retry_unconfirmed_insert_failed", { outbox_id: row.id, error: insertError.message });
+      continue;
+    }
+
+    await supabase
+      .from("whatsapp_outbox")
+      .update({ last_error: `retry_created:${inserted.id}` })
+      .eq("id", row.id);
+
+    log("outbox_unconfirmed_retry_created", {
+      original_outbox_id: row.id,
+      retry_outbox_id: inserted.id,
+      retry_connection_id: fallback.id,
+    });
+  }
+}
+
 async function claimOutbox(limit) {
   if (claimRpcAvailable) {
     const { data, error } = await supabase.rpc("claim_whatsapp_outbox", {
@@ -666,8 +945,11 @@ async function claimOutbox(limit) {
 
     if (!error && Array.isArray(data)) return data;
 
-    if (error && isMissingRpc(error, "claim_whatsapp_outbox")) claimRpcAvailable = false;
-    else if (error) warn("claim_whatsapp_outbox_rpc_failed", { error: error.message });
+    if (error && isMissingRpc(error, "claim_whatsapp_outbox")) {
+      claimRpcAvailable = false;
+    } else if (error) {
+      warn("claim_whatsapp_outbox_rpc_failed", { error: error.message });
+    }
   }
 
   const { data, error } = await supabase
@@ -759,8 +1041,9 @@ function checkConnectionHealth(conn) {
   const localConnectedAt = connectedAt.get(conn.session_key);
   const dbConnectedAt = conn.last_connected_at ? Date.parse(conn.last_connected_at) : 0;
   const connectedSince = localConnectedAt || dbConnectedAt || 0;
+  const warmupMs = SESSION_WARMUP_SECONDS * 1000;
 
-  if (connectedSince && Date.now() - connectedSince < SESSION_WARMUP_SECONDS * 1000) {
+  if (connectedSince && Date.now() - connectedSince < warmupMs) {
     return { ok: false, reason: "session_warmup" };
   }
 
@@ -794,7 +1077,6 @@ async function pickHealthyConnection(row) {
   }
 
   const fallbacks = await listTenantConnectedConnections(row.tenant_id, row.wa_connection_id);
-
   for (const fallback of fallbacks) {
     const health = checkConnectionHealth(fallback);
     if (health.ok) {
@@ -803,6 +1085,10 @@ async function pickHealthyConnection(row) {
         from_connection_id: row.wa_connection_id || null,
         to_connection_id: fallback.id,
         session_key: fallback.session_key,
+      });
+      await recordHealthLog(fallback, "fallback_used", "primary_connection_unhealthy", {
+        outbox_id: row.id,
+        from_connection_id: row.wa_connection_id || null,
       });
       return { conn: fallback, sock: health.sock };
     }
@@ -819,9 +1105,30 @@ async function pickHealthyConnection(row) {
   return { conn: null, sock: null };
 }
 
+async function runWithSessionLock(sessionKey, task) {
+  if (SESSION_SEND_CONCURRENCY > 1) {
+    return task();
+  }
+
+  const key = sessionKey || "__missing_session_key__";
+  const previous = sessionQueues.get(key) || Promise.resolve();
+  let current;
+
+  current = previous
+    .catch(() => {})
+    .then(task)
+    .finally(() => {
+      if (sessionQueues.get(key) === current) {
+        sessionQueues.delete(key);
+      }
+    });
+
+  sessionQueues.set(key, current);
+  return current;
+}
+
 async function resolveWhatsAppJid(sock, phone) {
   const variants = buildBrazilPhoneVariants(phone);
-
   for (const variant of variants) {
     const check = await sock.onWhatsApp(variant);
     const first = Array.isArray(check) ? check[0] : null;
@@ -832,7 +1139,11 @@ async function resolveWhatsAppJid(sock, phone) {
 
     if (exists && jid) {
       log("phone_resolved", { input_phone: String(phone || ""), resolved_phone: variant, jid });
-      return { input_phone: String(phone || ""), resolved_phone: variant, jid };
+      return {
+        input_phone: String(phone || ""),
+        resolved_phone: variant,
+        jid,
+      };
     }
   }
 
@@ -845,7 +1156,12 @@ async function failOutbox(row, status, lastError, extra = {}) {
 
   const { error } = await supabase
     .from("whatsapp_outbox")
-    .update({ status: finalStatus, tries, last_error: lastError, ...extra })
+    .update({
+      status: finalStatus,
+      tries,
+      last_error: lastError,
+      ...extra,
+    })
     .eq("id", row.id);
 
   if (error) warn("outbox_fail_update_failed", { outbox_id: row.id, error: error.message });
@@ -871,7 +1187,8 @@ async function sendOutboxRow(row) {
       return;
     }
 
-    if (!buildBrazilPhoneVariants(row.to_phone).length) {
+    const variants = buildBrazilPhoneVariants(row.to_phone);
+    if (!variants.length) {
       await failOutbox(row, "error", "invalid_phone");
       return;
     }
@@ -886,54 +1203,66 @@ async function sendOutboxRow(row) {
     const sock = picked.sock;
     selectedSessionKey = conn.session_key;
 
-    if (!CHECK_ON_WHATSAPP) {
-      warn("check_on_whatsapp_disabled_but_jid_resolution_required", { outbox_id: row.id });
-    }
+    await runWithSessionLock(selectedSessionKey, async () => {
+      if (!CHECK_ON_WHATSAPP) {
+        warn("check_on_whatsapp_disabled_but_jid_resolution_required", { outbox_id: row.id });
+      }
 
-    const resolved = await resolveWhatsAppJid(sock, row.to_phone);
-    if (!resolved) {
-      await failOutbox(row, "error", "number_not_on_whatsapp");
-      return;
-    }
+      const resolved = await resolveWhatsAppJid(sock, row.to_phone);
+      if (!resolved) {
+        await failOutbox(row, "error", "number_not_on_whatsapp");
+        return;
+      }
 
-    const sent = await sock.sendMessage(resolved.jid, { text });
-    const messageId = sent && sent.key ? sent.key.id || null : null;
-    const sentAt = nowIso();
+      const sent = await sock.sendMessage(resolved.jid, { text });
+      const messageId = sent && sent.key ? sent.key.id || null : null;
+      const sentAt = nowIso();
 
-    const { error } = await supabase
-      .from("whatsapp_outbox")
-      .update({
-        status: "server_ack",
-        ack_status: "server_ack",
-        sent_at: sentAt,
-        acked_at: sentAt,
-        last_error: null,
-        tries: Number(row.tries || 0) + 1,
-        wa_message_id: messageId,
-        remote_jid: resolved.jid,
+      const { error } = await supabase
+        .from("whatsapp_outbox")
+        .update({
+          status: "server_ack",
+          ack_status: "server_ack",
+          sent_at: sentAt,
+          acked_at: sentAt,
+          last_error: null,
+          tries: Number(row.tries || 0) + 1,
+          wa_message_id: messageId,
+          remote_jid: resolved.jid,
+          resolved_phone: resolved.resolved_phone,
+          wa_connection_id: conn.id,
+          wa_connection_label: conn.label || null,
+          sent_by_phone: conn.phone_number || null,
+          connection_snapshot: connectionSnapshot(conn),
+        })
+        .eq("id", row.id);
+
+      if (error) {
+        warn("outbox_server_ack_update_failed", { outbox_id: row.id, error: error.message });
+        return;
+      }
+
+      log("outbox_server_ack", {
+        outbox_id: row.id,
+        to_phone: row.to_phone,
         resolved_phone: resolved.resolved_phone,
-        wa_connection_id: conn.id,
-        wa_connection_label: conn.label || null,
-        sent_by_phone: conn.phone_number || null,
-        connection_snapshot: connectionSnapshot(conn),
-      })
-      .eq("id", row.id);
-
-    if (error) {
-      warn("outbox_server_ack_update_failed", { outbox_id: row.id, error: error.message });
-      return;
-    }
-
-    log("outbox_server_ack", {
-      outbox_id: row.id,
-      to_phone: row.to_phone,
-      resolved_phone: resolved.resolved_phone,
-      remote_jid: resolved.jid,
-      session_key: conn.session_key,
-      message_id: messageId,
+        remote_jid: resolved.jid,
+        session_key: conn.session_key,
+        message_id: messageId,
+      });
     });
   } catch (err) {
     markUnhealthyFromError(selectedSessionKey, err);
+    await registerConnectionError(selectedSessionKey, String(err && err.message ? err.message : err || "send_failed"), {
+      outbox_id: row.id,
+      source: "sendOutboxRow",
+    });
+    if (selectedSessionKey) {
+      const conn = await getConnectionBySessionKey(selectedSessionKey);
+      await recordHealthLog(conn || { session_key: selectedSessionKey }, "send_failed", String(err && err.message ? err.message : err || "send_failed"), {
+        outbox_id: row.id,
+      });
+    }
 
     const tries = Number(row.tries || 0) + 1;
     const status = tries >= MAX_OUTBOX_TRIES ? "error" : "pending";
@@ -941,7 +1270,11 @@ async function sendOutboxRow(row) {
 
     const { error } = await supabase
       .from("whatsapp_outbox")
-      .update({ status, tries, last_error: message })
+      .update({
+        status,
+        tries,
+        last_error: message,
+      })
       .eq("id", row.id);
 
     if (error) warn("outbox_send_error_update_failed", { outbox_id: row.id, error: error.message });
@@ -950,24 +1283,61 @@ async function sendOutboxRow(row) {
 }
 
 async function processOutbox() {
+  if (!(await ensureWorkerLock())) return;
   if (processingOutbox) return;
   processingOutbox = true;
 
   try {
     await resetStaleOutbox();
     await markUnconfirmedOutbox();
+    await retryUnconfirmedOutbox();
 
     const rows = await claimOutbox(OUTBOX_BATCH);
     if (!rows.length) return;
 
     log("outbox_claimed", { count: rows.length });
 
-    for (const row of rows) await sendOutboxRow(row);
+    for (const row of rows) {
+      await sendOutboxRow(row);
+    }
   } catch (err) {
     errorLog("process_outbox_failed", { error: String(err && err.message ? err.message : err) });
   } finally {
     processingOutbox = false;
   }
+}
+
+async function releaseWorkerLock() {
+  if (!workerLockAcquired) return;
+
+  const { error } = await supabase.rpc("release_wa_worker_lock", {
+    p_instance_id: WORKER_INSTANCE_ID,
+  });
+
+  if (error && !isMissingRpc(error, "release_wa_worker_lock")) {
+    warn("worker_lock_release_failed", { instance_id: WORKER_INSTANCE_ID, error: error.message });
+  }
+
+  workerLockAcquired = false;
+}
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  log("worker_shutdown", { signal, instance_id: WORKER_INSTANCE_ID });
+
+  for (const sessionKey of Array.from(sockets.keys())) {
+    await stopSession(sessionKey, {
+      clearCreds: false,
+      doLogout: false,
+      markIntentional: true,
+      reason: `shutdown_${signal}`,
+    });
+  }
+
+  await releaseWorkerLock();
+  process.exit(0);
 }
 
 async function bootstrap() {
@@ -976,6 +1346,8 @@ async function bootstrap() {
   log("worker_started", {
     tokens_base_dir: TOKENS_BASE_DIR,
     tokens_folder: TOKENS_FOLDER,
+    worker_instance_id: WORKER_INSTANCE_ID,
+    worker_lock_ttl_seconds: WORKER_LOCK_TTL_SECONDS,
     refresh_sessions_ms: REFRESH_SESSIONS_MS,
     process_outbox_ms: PROCESS_OUTBOX_MS,
     outbox_batch: OUTBOX_BATCH,
@@ -983,12 +1355,16 @@ async function bootstrap() {
     max_outbox_tries: MAX_OUTBOX_TRIES,
     sending_stale_minutes: SENDING_STALE_MINUTES,
     unconfirmed_after_minutes: UNCONFIRMED_AFTER_MINUTES,
+    auto_retry_unconfirmed: AUTO_RETRY_UNCONFIRMED,
+    unconfirmed_retry_after_minutes: UNCONFIRMED_RETRY_AFTER_MINUTES,
     session_warmup_seconds: SESSION_WARMUP_SECONDS,
+    session_send_concurrency: SESSION_SEND_CONCURRENCY,
     unhealthy_cooldown_seconds: UNHEALTHY_COOLDOWN_SECONDS,
     qr_retry_ms: QR_RETRY_MS,
     qr_max_restarts: QR_MAX_RESTARTS,
     close_retry_ms: CLOSE_RETRY_MS,
     close_max_restarts: CLOSE_MAX_RESTARTS,
+    clean_orphan_tokens: CLEAN_ORPHAN_TOKENS,
   });
 
   await refreshSessions();
@@ -1010,4 +1386,18 @@ async function bootstrap() {
 bootstrap().catch((err) => {
   errorLog("worker_bootstrap_failed", { error: String(err && err.message ? err.message : err) });
   process.exit(1);
+});
+
+process.on("SIGINT", () => {
+  shutdown("SIGINT").catch((err) => {
+    errorLog("worker_shutdown_failed", { signal: "SIGINT", error: String(err && err.message ? err.message : err) });
+    process.exit(1);
+  });
+});
+
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM").catch((err) => {
+    errorLog("worker_shutdown_failed", { signal: "SIGTERM", error: String(err && err.message ? err.message : err) });
+    process.exit(1);
+  });
 });
