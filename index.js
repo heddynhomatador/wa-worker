@@ -31,6 +31,14 @@ const AUTO_RETRY_UNCONFIRMED = String(process.env.AUTO_RETRY_UNCONFIRMED || "fal
 const UNCONFIRMED_RETRY_AFTER_MINUTES = Number(process.env.UNCONFIRMED_RETRY_AFTER_MINUTES || 15);
 const SESSION_WARMUP_SECONDS = Number(process.env.SESSION_WARMUP_SECONDS || 15);
 const UNHEALTHY_COOLDOWN_SECONDS = Number(process.env.UNHEALTHY_COOLDOWN_SECONDS || 120);
+const DISABLE_FALLBACK_CONNECTION = String(process.env.DISABLE_FALLBACK_CONNECTION || "true") === "true";
+const REALTIME_RETRY_DELAYS_SECONDS = String(process.env.REALTIME_RETRY_DELAYS_SECONDS || "5,15,30,60")
+  .split(",")
+  .map((value) => Number(String(value).trim()))
+  .filter((value) => Number.isFinite(value) && value > 0);
+const ON_WHATSAPP_TIMEOUT_MS = Number(process.env.ON_WHATSAPP_TIMEOUT_MS || 15000);
+const SEND_MESSAGE_TIMEOUT_MS = Number(process.env.SEND_MESSAGE_TIMEOUT_MS || 60000);
+const SESSION_HEALTH_SYNC_MS = Number(process.env.SESSION_HEALTH_SYNC_MS || 1800000);
 const WORKER_INSTANCE_ID = process.env.WORKER_INSTANCE_ID ||
   `${os.hostname()}-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 const WORKER_LOCK_TTL_SECONDS = Number(process.env.WORKER_LOCK_TTL_SECONDS || 60);
@@ -72,6 +80,7 @@ const connectionErrorHistory = new Map();
 let connections = [];
 let refreshingSessions = false;
 let processingOutbox = false;
+let syncingSessionHealth = false;
 let workerLockAcquired = false;
 let workerLockRpcAvailable = true;
 let lastOrphanTokenScanAt = 0;
@@ -99,6 +108,30 @@ function errorLog(event, fields = {}) {
 function safeDetails(details) {
   if (!details || typeof details !== "object") return {};
   return details;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  if (!timeoutMs || timeoutMs <= 0) return promise;
+
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label || "operation"}_timed_out_after_${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function isTemporaryRealtimeError(err) {
+  const message = String(err && err.message ? err.message : err || "");
+  return /(408|500|503|timed out|timeout|stream:error|stream errored|connection|socket|closed|not open|messagecountererror)/i.test(message);
 }
 
 function ensureDir(dir) {
@@ -446,6 +479,45 @@ async function updateConnectedIdentity(sessionKey, sock) {
       wa_jid: rawJid || null,
     });
   }
+}
+
+async function syncOneSessionIdentity(conn, sock, reason = "periodic_health_sync") {
+  if (!conn || !conn.session_key || !sock || !sock.user) {
+    return false;
+  }
+
+  const rawJid = jidNormalizedUser(sock.user.id || "");
+  const phone = parsePhoneFromJid(rawJid);
+  const pushName = (sock.user && (sock.user.name || sock.user.verifiedName)) || null;
+
+  connectedAt.set(conn.session_key, connectedAt.get(conn.session_key) || Date.now());
+  unhealthyUntil.delete(conn.session_key);
+  unhealthyReason.delete(conn.session_key);
+
+  await safeUpdateConn(conn.session_key, {
+    status: "connected",
+    qr_base64: null,
+    last_seen: nowIso(),
+    phone_number: phone || null,
+    wa_jid: rawJid || null,
+    push_name: pushName,
+    status_reason: null,
+  });
+
+  log("session_health_ok", {
+    connection_id: conn.id || null,
+    session_key: conn.session_key,
+    phone_number: phone || null,
+    wa_jid: rawJid || null,
+    reason,
+  });
+
+  await recordHealthLog(conn, "session_health_ok", reason, {
+    phone_number: phone || null,
+    wa_jid: rawJid || null,
+  });
+
+  return true;
 }
 
 async function markSleeping(sessionKey, reason) {
@@ -835,6 +907,40 @@ async function refreshSessions() {
   }
 }
 
+async function syncSessionHealth() {
+  if (!(await ensureWorkerLock())) return;
+  if (syncingSessionHealth) return;
+  syncingSessionHealth = true;
+
+  try {
+    await refreshConnectionsCache();
+
+    for (const conn of connections) {
+      if (!conn || !conn.session_key || conn.deleted_at || conn.status === STATUS_SLEEPING) continue;
+
+      const sock = sockets.get(conn.session_key);
+      if (sock && sock.user) {
+        await syncOneSessionIdentity(conn, sock);
+        continue;
+      }
+
+      if (conn.status === "connected") {
+        markUnhealthy(conn.session_key, "session_health_missing_socket");
+        log("session_health_failed", {
+          connection_id: conn.id || null,
+          session_key: conn.session_key,
+          reason: "missing_connected_socket",
+        });
+        await recordHealthLog(conn, "session_health_failed", "missing_connected_socket");
+      }
+    }
+  } catch (err) {
+    errorLog("session_health_sync_failed", { error: String(err && err.message ? err.message : err) });
+  } finally {
+    syncingSessionHealth = false;
+  }
+}
+
 async function resetStaleOutbox() {
   if (!resetStaleRpcAvailable || SENDING_STALE_MINUTES <= 0) return;
 
@@ -895,6 +1001,14 @@ async function retryUnconfirmedOutbox() {
 
   for (const row of data || []) {
     if (String(row.last_error || "").startsWith("retry_created:")) continue;
+
+    if (DISABLE_FALLBACK_CONNECTION) {
+      log("outbox_unconfirmed_retry_skipped", {
+        outbox_id: row.id,
+        reason: "fallback_connection_disabled",
+      });
+      continue;
+    }
 
     const fallbacks = await listTenantConnectedConnections(row.tenant_id, row.wa_connection_id);
     const fallback = fallbacks.find((candidate) => checkConnectionHealth(candidate).ok) || null;
@@ -1073,7 +1187,18 @@ async function pickHealthyConnection(row) {
       reason: primaryHealth.reason,
       remaining_ms: primaryHealth.remaining_ms || 0,
       detail: primaryHealth.detail || null,
+      fallback_disabled: DISABLE_FALLBACK_CONNECTION,
     });
+  }
+
+  if (DISABLE_FALLBACK_CONNECTION) {
+    return {
+      conn: null,
+      sock: null,
+      reason: primaryHealth.reason,
+      remaining_ms: primaryHealth.remaining_ms || 0,
+      detail: primaryHealth.detail || null,
+    };
   }
 
   const fallbacks = await listTenantConnectedConnections(row.tenant_id, row.wa_connection_id);
@@ -1130,7 +1255,7 @@ async function runWithSessionLock(sessionKey, task) {
 async function resolveWhatsAppJid(sock, phone) {
   const variants = buildBrazilPhoneVariants(phone);
   for (const variant of variants) {
-    const check = await sock.onWhatsApp(variant);
+    const check = await withTimeout(sock.onWhatsApp(variant), ON_WHATSAPP_TIMEOUT_MS, "on_whatsapp");
     const first = Array.isArray(check) ? check[0] : null;
     const exists = !!(first && first.exists);
     const jid = first && first.jid ? first.jid : null;
@@ -1177,109 +1302,150 @@ async function releaseOutbox(row, lastError) {
   if (error) warn("outbox_release_failed", { outbox_id: row.id, error: error.message });
 }
 
+async function markRealtimeWindowFailed(row, lastError) {
+  const tries = Number(row.tries || 0) + 1;
+  const { error } = await supabase
+    .from("whatsapp_outbox")
+    .update({
+      status: "error",
+      tries,
+      last_error: lastError,
+    })
+    .eq("id", row.id);
+
+  if (error) warn("outbox_realtime_window_failed_update_failed", { outbox_id: row.id, error: error.message });
+  log("outbox_failed", { outbox_id: row.id, status: "error", tries, last_error: lastError });
+}
+
 async function sendOutboxRow(row) {
   let selectedSessionKey = null;
 
-  try {
-    const text = String(row.message || "").trim();
-    if (!text) {
-      await failOutbox(row, "error", "empty_message");
-      return;
-    }
+  const text = String(row.message || "").trim();
+  if (!text) {
+    await failOutbox(row, "error", "empty_message");
+    return;
+  }
 
-    const variants = buildBrazilPhoneVariants(row.to_phone);
-    if (!variants.length) {
-      await failOutbox(row, "error", "invalid_phone");
-      return;
+  const variants = buildBrazilPhoneVariants(row.to_phone);
+  if (!variants.length) {
+    await failOutbox(row, "error", "invalid_phone");
+    return;
+  }
+
+  const totalAttempts = 1 + REALTIME_RETRY_DELAYS_SECONDS.length;
+  let lastRealtimeError = "unknown_realtime_error";
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
+    if (attempt > 1) {
+      const delaySeconds = REALTIME_RETRY_DELAYS_SECONDS[attempt - 2] || 0;
+      log("outbox_realtime_retry_wait", {
+        outbox_id: row.id,
+        attempt,
+        total_attempts: totalAttempts,
+        delay_seconds: delaySeconds,
+        last_error: lastRealtimeError,
+      });
+      await sleep(delaySeconds * 1000);
     }
 
     const picked = await pickHealthyConnection(row);
     if (!picked.conn || !picked.sock) {
-      await releaseOutbox(row, "no_healthy_connected_socket_available");
-      return;
+      lastRealtimeError = `primary_connection_unhealthy:${picked.reason || "no_healthy_connected_socket_available"}`;
+      continue;
     }
 
     const conn = picked.conn;
     const sock = picked.sock;
     selectedSessionKey = conn.session_key;
 
-    await runWithSessionLock(selectedSessionKey, async () => {
-      if (!CHECK_ON_WHATSAPP) {
-        warn("check_on_whatsapp_disabled_but_jid_resolution_required", { outbox_id: row.id });
-      }
+    try {
+      const result = await runWithSessionLock(selectedSessionKey, async () => {
+        if (!CHECK_ON_WHATSAPP) {
+          warn("check_on_whatsapp_disabled_but_jid_resolution_required", { outbox_id: row.id });
+        }
 
-      const resolved = await resolveWhatsAppJid(sock, row.to_phone);
-      if (!resolved) {
-        await failOutbox(row, "error", "number_not_on_whatsapp");
-        return;
-      }
+        const resolved = await resolveWhatsAppJid(sock, row.to_phone);
+        if (!resolved) {
+          await failOutbox(row, "error", "number_not_on_whatsapp");
+          return "definitive_error";
+        }
 
-      const sent = await sock.sendMessage(resolved.jid, { text });
-      const messageId = sent && sent.key ? sent.key.id || null : null;
-      const sentAt = nowIso();
+        const sent = await withTimeout(
+          sock.sendMessage(resolved.jid, { text }),
+          SEND_MESSAGE_TIMEOUT_MS,
+          "send_message",
+        );
+        const messageId = sent && sent.key ? sent.key.id || null : null;
+        const sentAt = nowIso();
 
-      const { error } = await supabase
-        .from("whatsapp_outbox")
-        .update({
-          status: "server_ack",
-          ack_status: "server_ack",
-          sent_at: sentAt,
-          acked_at: sentAt,
-          last_error: null,
-          tries: Number(row.tries || 0) + 1,
-          wa_message_id: messageId,
-          remote_jid: resolved.jid,
+        const { error } = await supabase
+          .from("whatsapp_outbox")
+          .update({
+            status: "server_ack",
+            ack_status: "server_ack",
+            sent_at: sentAt,
+            acked_at: sentAt,
+            last_error: null,
+            tries: Number(row.tries || 0) + 1,
+            wa_message_id: messageId,
+            remote_jid: resolved.jid,
+            resolved_phone: resolved.resolved_phone,
+            wa_connection_id: conn.id,
+            wa_connection_label: conn.label || null,
+            sent_by_phone: conn.phone_number || null,
+            connection_snapshot: connectionSnapshot(conn),
+          })
+          .eq("id", row.id);
+
+        if (error) {
+          warn("outbox_server_ack_update_failed", { outbox_id: row.id, error: error.message });
+          return "server_ack_update_failed";
+        }
+
+        log("outbox_server_ack", {
+          outbox_id: row.id,
+          to_phone: row.to_phone,
           resolved_phone: resolved.resolved_phone,
-          wa_connection_id: conn.id,
-          wa_connection_label: conn.label || null,
-          sent_by_phone: conn.phone_number || null,
-          connection_snapshot: connectionSnapshot(conn),
-        })
-        .eq("id", row.id);
+          remote_jid: resolved.jid,
+          session_key: conn.session_key,
+          message_id: messageId,
+          realtime_attempt: attempt,
+        });
 
-      if (error) {
-        warn("outbox_server_ack_update_failed", { outbox_id: row.id, error: error.message });
+        return "sent";
+      });
+
+      if (result === "sent" || result === "definitive_error" || result === "server_ack_update_failed") {
         return;
       }
+    } catch (err) {
+      const message = String(err && err.message ? err.message : err || "send_failed");
+      lastRealtimeError = message;
+      markUnhealthyFromError(selectedSessionKey, err);
+      await registerConnectionError(selectedSessionKey, message, {
+        outbox_id: row.id,
+        source: "sendOutboxRow",
+        realtime_attempt: attempt,
+        total_attempts: totalAttempts,
+      });
 
-      log("outbox_server_ack", {
-        outbox_id: row.id,
-        to_phone: row.to_phone,
-        resolved_phone: resolved.resolved_phone,
-        remote_jid: resolved.jid,
-        session_key: conn.session_key,
-        message_id: messageId,
-      });
-    });
-  } catch (err) {
-    markUnhealthyFromError(selectedSessionKey, err);
-    await registerConnectionError(selectedSessionKey, String(err && err.message ? err.message : err || "send_failed"), {
-      outbox_id: row.id,
-      source: "sendOutboxRow",
-    });
-    if (selectedSessionKey) {
-      const conn = await getConnectionBySessionKey(selectedSessionKey);
-      await recordHealthLog(conn || { session_key: selectedSessionKey }, "send_failed", String(err && err.message ? err.message : err || "send_failed"), {
-        outbox_id: row.id,
-      });
+      if (selectedSessionKey) {
+        const currentConn = await getConnectionBySessionKey(selectedSessionKey);
+        await recordHealthLog(currentConn || { session_key: selectedSessionKey }, "send_failed", message, {
+          outbox_id: row.id,
+          realtime_attempt: attempt,
+          total_attempts: totalAttempts,
+        });
+      }
+
+      if (!isTemporaryRealtimeError(err)) {
+        await failOutbox(row, "error", message);
+        return;
+      }
     }
-
-    const tries = Number(row.tries || 0) + 1;
-    const status = tries >= MAX_OUTBOX_TRIES ? "error" : "pending";
-    const message = String(err && err.message ? err.message : err || "send_failed");
-
-    const { error } = await supabase
-      .from("whatsapp_outbox")
-      .update({
-        status,
-        tries,
-        last_error: message,
-      })
-      .eq("id", row.id);
-
-    if (error) warn("outbox_send_error_update_failed", { outbox_id: row.id, error: error.message });
-    log("outbox_failed", { outbox_id: row.id, status, tries, last_error: message });
   }
+
+  await markRealtimeWindowFailed(row, `connection_not_healthy_in_realtime_window:${lastRealtimeError}`);
 }
 
 async function processOutbox() {
@@ -1357,6 +1523,11 @@ async function bootstrap() {
     unconfirmed_after_minutes: UNCONFIRMED_AFTER_MINUTES,
     auto_retry_unconfirmed: AUTO_RETRY_UNCONFIRMED,
     unconfirmed_retry_after_minutes: UNCONFIRMED_RETRY_AFTER_MINUTES,
+    disable_fallback_connection: DISABLE_FALLBACK_CONNECTION,
+    realtime_retry_delays_seconds: REALTIME_RETRY_DELAYS_SECONDS,
+    on_whatsapp_timeout_ms: ON_WHATSAPP_TIMEOUT_MS,
+    send_message_timeout_ms: SEND_MESSAGE_TIMEOUT_MS,
+    session_health_sync_ms: SESSION_HEALTH_SYNC_MS,
     session_warmup_seconds: SESSION_WARMUP_SECONDS,
     session_send_concurrency: SESSION_SEND_CONCURRENCY,
     unhealthy_cooldown_seconds: UNHEALTHY_COOLDOWN_SECONDS,
@@ -1368,6 +1539,7 @@ async function bootstrap() {
   });
 
   await refreshSessions();
+  await syncSessionHealth();
   await processOutbox();
 
   setInterval(() => {
@@ -1381,6 +1553,12 @@ async function bootstrap() {
       errorLog("process_outbox_interval_failed", { error: String(err && err.message ? err.message : err) });
     });
   }, PROCESS_OUTBOX_MS);
+
+  setInterval(() => {
+    syncSessionHealth().catch((err) => {
+      errorLog("session_health_sync_interval_failed", { error: String(err && err.message ? err.message : err) });
+    });
+  }, SESSION_HEALTH_SYNC_MS);
 }
 
 bootstrap().catch((err) => {
