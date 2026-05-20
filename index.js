@@ -13,7 +13,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
-const WebSocket = require("ws");
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -39,6 +39,19 @@ const REALTIME_RETRY_DELAYS_SECONDS = String(process.env.REALTIME_RETRY_DELAYS_S
 const ON_WHATSAPP_TIMEOUT_MS = Number(process.env.ON_WHATSAPP_TIMEOUT_MS || 15000);
 const SEND_MESSAGE_TIMEOUT_MS = Number(process.env.SEND_MESSAGE_TIMEOUT_MS || 60000);
 const SESSION_HEALTH_SYNC_MS = Number(process.env.SESSION_HEALTH_SYNC_MS || 1800000);
+const SESSION_READY_AFTER_SECONDS = Number(process.env.SESSION_READY_AFTER_SECONDS || 60);
+const READY_CHECK_ON_WHATSAPP = String(process.env.READY_CHECK_ON_WHATSAPP || "true") === "true";
+const READY_CHECK_TIMEOUT_MS = Number(process.env.READY_CHECK_TIMEOUT_MS || 15000);
+const BAILEYS_FIRE_INIT_QUERIES = String(process.env.BAILEYS_FIRE_INIT_QUERIES || "false") === "true";
+const BAILEYS_FETCH_LATEST_VERSION = String(process.env.BAILEYS_FETCH_LATEST_VERSION || "false") === "true";
+const BAILEYS_CONNECT_TIMEOUT_MS = Number(process.env.BAILEYS_CONNECT_TIMEOUT_MS || 60000);
+const BAILEYS_KEEP_ALIVE_INTERVAL_MS = Number(process.env.BAILEYS_KEEP_ALIVE_INTERVAL_MS || 25000);
+const BAILEYS_DEFAULT_QUERY_TIMEOUT_MS = Number(process.env.BAILEYS_DEFAULT_QUERY_TIMEOUT_MS || 60000);
+const BAILEYS_RETRY_REQUEST_DELAY_MS = Number(process.env.BAILEYS_RETRY_REQUEST_DELAY_MS || 500);
+const BAILEYS_MAX_MSG_RETRY_COUNT = Number(process.env.BAILEYS_MAX_MSG_RETRY_COUNT || 5);
+const BAILEYS_ENABLE_AUTO_SESSION_RECREATION = String(process.env.BAILEYS_ENABLE_AUTO_SESSION_RECREATION || "true") === "true";
+const BAILEYS_ENABLE_RECENT_MESSAGE_CACHE = String(process.env.BAILEYS_ENABLE_RECENT_MESSAGE_CACHE || "true") === "true";
+const BAILEYS_EMIT_OWN_EVENTS = String(process.env.BAILEYS_EMIT_OWN_EVENTS || "true") === "true";
 const WORKER_INSTANCE_ID = process.env.WORKER_INSTANCE_ID ||
   `${os.hostname()}-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 const WORKER_LOCK_TTL_SECONDS = Number(process.env.WORKER_LOCK_TTL_SECONDS || 60);
@@ -50,12 +63,14 @@ const QR_RETRY_MS = Number(process.env.QR_RETRY_MS || 60000);
 const QR_MAX_RESTARTS = Number(process.env.QR_MAX_RESTARTS || 3);
 const CLOSE_RETRY_MS = Number(process.env.CLOSE_RETRY_MS || 15000);
 const CLOSE_MAX_RESTARTS = Number(process.env.CLOSE_MAX_RESTARTS || 5);
+const STATUS_WARMING_UP = "warming_up";
+const STATUS_CONNECTED = "connected";
 const STATUS_SLEEPING = "sleeping";
 const CONNECTION_ERROR_WINDOW_SECONDS = Number(process.env.CONNECTION_ERROR_WINDOW_SECONDS || 300);
 const CONNECTION_ERROR_SLEEP_THRESHOLD = Number(process.env.CONNECTION_ERROR_SLEEP_THRESHOLD || 5);
 
-const HEALTH_ERROR_RE = /(408|500|503|timed out|timeout|messagecountererror|stream:error|stream errored)/i;
-const UNHEALTHY_CLOSE_CODES = new Set([408, 500, 503]);
+const HEALTH_ERROR_RE = /(408|428|500|503|515|timed out|timeout|messagecountererror|stream:error|stream errored|connection terminated|connection errored|init queries)/i;
+const UNHEALTHY_CLOSE_CODES = new Set([408, 428, 500, 503, 515]);
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -63,11 +78,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  realtime: {
-    transport: WebSocket,
-  },
-});
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const sockets = new Map();
 const starting = new Set();
@@ -76,10 +87,13 @@ const restartTimers = new Map();
 const qrRestartCounts = new Map();
 const closeRestartCounts = new Map();
 const connectedAt = new Map();
+const readyAt = new Map();
+const readyTimers = new Map();
 const unhealthyUntil = new Map();
 const unhealthyReason = new Map();
 const sessionQueues = new Map();
 const connectionErrorHistory = new Map();
+const recentOutboundMessages = new Map();
 
 let connections = [];
 let refreshingSessions = false;
@@ -136,6 +150,97 @@ function withTimeout(promise, timeoutMs, label) {
 function isTemporaryRealtimeError(err) {
   const message = String(err && err.message ? err.message : err || "");
   return /(408|500|503|timed out|timeout|stream:error|stream errored|connection|socket|closed|not open|messagecountererror)/i.test(message);
+}
+
+function createBaileysLogger(sessionKey) {
+  const write = (level, args) => {
+    const text = args
+      .map((arg) => {
+        if (typeof arg === "string") return arg;
+        try {
+          return JSON.stringify(arg);
+        } catch {
+          return String(arg);
+        }
+      })
+      .join(" ");
+
+    const payload = {
+      session_key: sessionKey,
+      level,
+      message: text.slice(0, 1000),
+    };
+
+    if (level === "error" || level === "fatal") {
+      warn("baileys_internal_error", payload);
+    } else if (level === "warn") {
+      warn("baileys_internal_warn", payload);
+    }
+
+    if (HEALTH_ERROR_RE.test(text)) {
+      setTimeout(() => {
+        registerConnectionError(sessionKey, text.slice(0, 500), {
+          source: "baileys_logger",
+          level,
+        }).catch((err) => {
+          errorLog("baileys_logger_register_error_failed", {
+            session_key: sessionKey,
+            error: String(err && err.message ? err.message : err),
+          });
+        });
+      }, 0);
+    }
+  };
+
+  const logger = {
+    trace: (...args) => write("trace", args),
+    debug: (...args) => write("debug", args),
+    info: (...args) => write("info", args),
+    warn: (...args) => write("warn", args),
+    error: (...args) => write("error", args),
+    fatal: (...args) => write("fatal", args),
+    child: () => logger,
+  };
+
+  return logger;
+}
+
+function rememberOutboundMessage(messageId, text) {
+  if (!messageId || !text) return;
+  recentOutboundMessages.set(messageId, {
+    message: { conversation: String(text) },
+    created_at: Date.now(),
+  });
+
+  if (recentOutboundMessages.size <= 1000) return;
+
+  const sorted = Array.from(recentOutboundMessages.entries())
+    .sort((a, b) => a[1].created_at - b[1].created_at)
+    .slice(0, recentOutboundMessages.size - 1000);
+
+  for (const [key] of sorted) recentOutboundMessages.delete(key);
+}
+
+async function getMessageForRetry(key) {
+  const messageId = key && key.id ? String(key.id) : "";
+  if (!messageId) return undefined;
+
+  const cached = recentOutboundMessages.get(messageId);
+  if (cached && cached.message) return cached.message;
+
+  const { data, error } = await supabase
+    .from("whatsapp_outbox")
+    .select("message")
+    .eq("wa_message_id", messageId)
+    .maybeSingle();
+
+  if (error) {
+    warn("get_message_for_retry_failed", { message_id: messageId, error: error.message });
+    return undefined;
+  }
+
+  const text = String(data && data.message ? data.message : "").trim();
+  return text ? { conversation: text } : undefined;
 }
 
 function ensureDir(dir) {
@@ -227,6 +332,12 @@ function clearRestartTimer(sessionKey) {
   restartTimers.delete(sessionKey);
 }
 
+function clearReadyTimer(sessionKey) {
+  const timer = readyTimers.get(sessionKey);
+  if (timer) clearTimeout(timer);
+  readyTimers.delete(sessionKey);
+}
+
 function incCounter(map, key) {
   const next = (map.get(key) || 0) + 1;
   map.set(key, next);
@@ -259,6 +370,14 @@ async function registerConnectionError(sessionKey, reason, details = {}) {
     markUnhealthy(sessionKey, textReason);
   }
 
+  readyAt.delete(sessionKey);
+  clearReadyTimer(sessionKey);
+  await safeUpdateConn(sessionKey, {
+    status: STATUS_WARMING_UP,
+    last_seen: nowIso(),
+    status_reason: `recent_error:${textReason.slice(0, 180)}`,
+  });
+
   const now = Date.now();
   const windowMs = CONNECTION_ERROR_WINDOW_SECONDS * 1000;
   const history = (connectionErrorHistory.get(sessionKey) || [])
@@ -279,6 +398,12 @@ async function registerConnectionError(sessionKey, reason, details = {}) {
 
   if (history.length >= CONNECTION_ERROR_SLEEP_THRESHOLD) {
     await markSleeping(sessionKey, `too_many_recent_errors:${textReason.slice(0, 120)}`);
+    return;
+  }
+
+  const sock = sockets.get(sessionKey);
+  if (sock && sock.user) {
+    scheduleReadyCheck(sessionKey, sock, UNHEALTHY_COOLDOWN_SECONDS * 1000, "recent_error_cooldown");
   }
 }
 
@@ -460,21 +585,27 @@ async function updateConnectedIdentity(sessionKey, sock) {
   const timestamp = Date.now();
 
   connectedAt.set(sessionKey, timestamp);
-  unhealthyUntil.delete(sessionKey);
-  unhealthyReason.delete(sessionKey);
+  readyAt.delete(sessionKey);
+  clearReadyTimer(sessionKey);
 
   await safeUpdateConn(sessionKey, {
-    status: "connected",
+    status: STATUS_WARMING_UP,
     qr_base64: null,
     last_seen: nowIso(),
     last_connected_at: new Date(timestamp).toISOString(),
     phone_number: phone || null,
     wa_jid: rawJid || null,
     push_name: pushName,
-    status_reason: null,
+    status_reason: `warming_up_for_${SESSION_READY_AFTER_SECONDS}s`,
   });
 
   log("connected", { session_key: sessionKey, phone_number: phone || null, wa_jid: rawJid || null });
+  log("session_warming_up", {
+    session_key: sessionKey,
+    phone_number: phone || null,
+    wa_jid: rawJid || null,
+    ready_after_seconds: SESSION_READY_AFTER_SECONDS,
+  });
 
   const row = await getConnectionBySessionKey(sessionKey);
   if (row) {
@@ -482,7 +613,13 @@ async function updateConnectedIdentity(sessionKey, sock) {
       phone_number: phone || null,
       wa_jid: rawJid || null,
     });
+    await recordHealthLog(row, "session_warming_up", `warming_up_for_${SESSION_READY_AFTER_SECONDS}s`, {
+      phone_number: phone || null,
+      wa_jid: rawJid || null,
+    });
   }
+
+  scheduleReadyCheck(sessionKey, sock, SESSION_READY_AFTER_SECONDS * 1000, "connection_opened");
 }
 
 async function syncOneSessionIdentity(conn, sock, reason = "periodic_health_sync") {
@@ -495,11 +632,12 @@ async function syncOneSessionIdentity(conn, sock, reason = "periodic_health_sync
   const pushName = (sock.user && (sock.user.name || sock.user.verifiedName)) || null;
 
   connectedAt.set(conn.session_key, connectedAt.get(conn.session_key) || Date.now());
+  readyAt.set(conn.session_key, Date.now());
   unhealthyUntil.delete(conn.session_key);
   unhealthyReason.delete(conn.session_key);
 
   await safeUpdateConn(conn.session_key, {
-    status: "connected",
+    status: STATUS_CONNECTED,
     qr_base64: null,
     last_seen: nowIso(),
     phone_number: phone || null,
@@ -524,7 +662,130 @@ async function syncOneSessionIdentity(conn, sock, reason = "periodic_health_sync
   return true;
 }
 
+async function runReadyCheck(conn, sock, reason) {
+  if (!conn || !conn.session_key) {
+    return { ok: false, reason: "missing_connection" };
+  }
+
+  if (conn.deleted_at) {
+    return { ok: false, reason: "deleted_connection" };
+  }
+
+  if (conn.status === STATUS_SLEEPING) {
+    return { ok: false, reason: STATUS_SLEEPING };
+  }
+
+  if (!sock || !sock.user) {
+    return { ok: false, reason: "missing_connected_socket" };
+  }
+
+  const connectedSince = connectedAt.get(conn.session_key) || Date.parse(conn.last_connected_at || "") || 0;
+  const minReadyMs = SESSION_READY_AFTER_SECONDS * 1000;
+  const ageMs = connectedSince ? Date.now() - connectedSince : 0;
+  if (connectedSince && ageMs < minReadyMs) {
+    return {
+      ok: false,
+      reason: "session_warming_up",
+      retry_after_ms: Math.max(1000, minReadyMs - ageMs),
+    };
+  }
+
+  const unhealthyMs = unhealthyRemainingMs(conn.session_key);
+  if (unhealthyMs > 0) {
+    return {
+      ok: false,
+      reason: "recent_session_error",
+      retry_after_ms: unhealthyMs,
+      detail: unhealthyReason.get(conn.session_key) || null,
+    };
+  }
+
+  if (READY_CHECK_ON_WHATSAPP) {
+    const rawJid = jidNormalizedUser(sock.user.id || "");
+    const ownPhone = parsePhoneFromJid(rawJid || conn.wa_jid || conn.phone_number || "");
+    if (!ownPhone) {
+      return { ok: false, reason: "missing_own_phone_for_ready_check" };
+    }
+
+    try {
+      const check = await withTimeout(sock.onWhatsApp(ownPhone), READY_CHECK_TIMEOUT_MS, "ready_on_whatsapp");
+      const first = Array.isArray(check) ? check[0] : null;
+      if (!first || first.exists === false) {
+        return { ok: false, reason: "ready_check_on_whatsapp_false" };
+      }
+    } catch (err) {
+      return {
+        ok: false,
+        reason: "ready_check_on_whatsapp_failed",
+        detail: String(err && err.message ? err.message : err),
+      };
+    }
+  }
+
+  return { ok: true, reason };
+}
+
+async function promoteSessionIfReady(sessionKey, sock, reason = "ready_check") {
+  const conn = await getConnectionBySessionKey(sessionKey);
+  const result = await runReadyCheck(conn, sock, reason);
+
+  if (result.ok) {
+    await syncOneSessionIdentity(conn, sock, reason);
+    clearReadyTimer(sessionKey);
+    log("session_ready", {
+      connection_id: conn.id || null,
+      session_key: sessionKey,
+      reason,
+    });
+    await recordHealthLog(conn, "session_ready", reason);
+    return true;
+  }
+
+  log("session_ready_check_failed", {
+    connection_id: conn && conn.id ? conn.id : null,
+    session_key: sessionKey,
+    reason: result.reason,
+    detail: result.detail || null,
+    retry_after_ms: result.retry_after_ms || 15000,
+  });
+
+  await recordHealthLog(conn || { session_key: sessionKey }, "session_ready_check_failed", result.reason, {
+    detail: result.detail || null,
+    retry_after_ms: result.retry_after_ms || 15000,
+  });
+
+  if (conn && !conn.deleted_at && conn.status !== STATUS_SLEEPING) {
+    await safeUpdateConn(sessionKey, {
+      status: STATUS_WARMING_UP,
+      last_seen: nowIso(),
+      status_reason: result.reason,
+    });
+    scheduleReadyCheck(sessionKey, sock, Math.min(Math.max(result.retry_after_ms || 15000, 5000), 120000), result.reason);
+  }
+
+  return false;
+}
+
+function scheduleReadyCheck(sessionKey, sock, delayMs, reason) {
+  clearReadyTimer(sessionKey);
+  const timer = setTimeout(() => {
+    readyTimers.delete(sessionKey);
+    promoteSessionIfReady(sessionKey, sock, reason).catch((err) => {
+      errorLog("session_ready_check_failed", {
+        session_key: sessionKey,
+        reason,
+        error: String(err && err.message ? err.message : err),
+      });
+    });
+  }, Math.max(0, delayMs || 0));
+
+  readyTimers.set(sessionKey, timer);
+}
+
 async function markSleeping(sessionKey, reason) {
+  readyAt.delete(sessionKey);
+  clearReadyTimer(sessionKey);
+
   await safeUpdateConn(sessionKey, {
     status: STATUS_SLEEPING,
     qr_base64: null,
@@ -571,10 +832,12 @@ async function stopSession(
   if (markIntentional) intentionalStops.add(sessionKey);
 
   clearRestartTimer(sessionKey);
+  clearReadyTimer(sessionKey);
   resetCounters(sessionKey);
   sockets.delete(sessionKey);
   starting.delete(sessionKey);
   connectedAt.delete(sessionKey);
+  readyAt.delete(sessionKey);
   unhealthyUntil.delete(sessionKey);
   unhealthyReason.delete(sessionKey);
 
@@ -628,37 +891,59 @@ async function startSession(sessionKey) {
     });
 
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
-    const { version } = await fetchLatestBaileysVersion();
-
-    const sock = makeWASocket({
-      version,
+    const socketConfig = {
       auth: state,
+      logger: createBaileysLogger(sessionKey),
       printQRInTerminal: false,
       syncFullHistory: false,
-      connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 20000,
-      defaultQueryTimeoutMs: 60000,
+      fireInitQueries: BAILEYS_FIRE_INIT_QUERIES,
+      emitOwnEvents: BAILEYS_EMIT_OWN_EVENTS,
+      enableAutoSessionRecreation: BAILEYS_ENABLE_AUTO_SESSION_RECREATION,
+      enableRecentMessageCache: BAILEYS_ENABLE_RECENT_MESSAGE_CACHE,
+      retryRequestDelayMs: BAILEYS_RETRY_REQUEST_DELAY_MS,
+      maxMsgRetryCount: BAILEYS_MAX_MSG_RETRY_COUNT,
+      connectTimeoutMs: BAILEYS_CONNECT_TIMEOUT_MS,
+      keepAliveIntervalMs: BAILEYS_KEEP_ALIVE_INTERVAL_MS,
+      defaultQueryTimeoutMs: BAILEYS_DEFAULT_QUERY_TIMEOUT_MS,
       markOnlineOnConnect: false,
       browser: ["URA Connect Hub", "Chrome", "1.0"],
-    });
+      getMessage: getMessageForRetry,
+      shouldSyncHistoryMessage: () => false,
+    };
+
+    if (BAILEYS_FETCH_LATEST_VERSION) {
+      const { version } = await fetchLatestBaileysVersion();
+      socketConfig.version = version;
+    }
+
+    const sock = makeWASocket(socketConfig);
 
     sockets.set(sessionKey, sock);
     sock.ev.on("creds.update", saveCreds);
     sock.ev.on("messages.update", (updates) => {
       handleMessagesUpdate(updates).catch((err) => {
         markUnhealthyFromError(sessionKey, err);
+        registerConnectionError(sessionKey, String(err && err.message ? err.message : err), {
+          source: "messages.update",
+        }).catch(() => {});
         errorLog("messages_update_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
       });
     });
     sock.ev.on("message-receipt.update", (updates) => {
       handleMessageReceiptUpdate(updates).catch((err) => {
         markUnhealthyFromError(sessionKey, err);
+        registerConnectionError(sessionKey, String(err && err.message ? err.message : err), {
+          source: "message-receipt.update",
+        }).catch(() => {});
         errorLog("message_receipt_update_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
       });
     });
     sock.ev.on("connection.update", (update) => {
       handleConnectionUpdate(sessionKey, authPath, sock, update).catch((err) => {
         markUnhealthyFromError(sessionKey, err);
+        registerConnectionError(sessionKey, String(err && err.message ? err.message : err), {
+          source: "connection.update.handler",
+        }).catch(() => {});
         errorLog("connection_update_handler_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
       });
     });
@@ -711,6 +996,8 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   sockets.delete(sessionKey);
   starting.delete(sessionKey);
   connectedAt.delete(sessionKey);
+  readyAt.delete(sessionKey);
+  clearReadyTimer(sessionKey);
 
   if (code && UNHEALTHY_CLOSE_CODES.has(Number(code))) {
     markUnhealthy(sessionKey, `close_${code}`);
@@ -924,11 +1211,11 @@ async function syncSessionHealth() {
 
       const sock = sockets.get(conn.session_key);
       if (sock && sock.user) {
-        await syncOneSessionIdentity(conn, sock);
+        await promoteSessionIfReady(conn.session_key, sock, "periodic_health_sync");
         continue;
       }
 
-      if (conn.status === "connected") {
+      if (conn.status === STATUS_CONNECTED || conn.status === STATUS_WARMING_UP) {
         markUnhealthy(conn.session_key, "session_health_missing_socket");
         log("session_health_failed", {
           connection_id: conn.id || null,
@@ -1122,7 +1409,7 @@ async function listTenantConnectedConnections(tenantId, excludeId) {
     .from("wa_connections")
     .select("id, tenant_id, label, session_key, status, phone_number, wa_jid, deleted_at, last_seen, last_connected_at")
     .eq("tenant_id", tenantId)
-    .eq("status", "connected")
+    .eq("status", STATUS_CONNECTED)
     .is("deleted_at", null)
     .neq("id", excludeId || NIL_UUID)
     .order("last_seen", { ascending: true })
@@ -1150,7 +1437,7 @@ function connectionSnapshot(conn) {
 function checkConnectionHealth(conn) {
   if (!conn) return { ok: false, reason: "missing_connection" };
   if (conn.deleted_at) return { ok: false, reason: "deleted_connection" };
-  if (conn.status !== "connected") return { ok: false, reason: `status_${conn.status || "unknown"}` };
+  if (conn.status !== STATUS_CONNECTED) return { ok: false, reason: `status_${conn.status || "unknown"}` };
   if (!conn.session_key) return { ok: false, reason: "missing_session_key" };
 
   const sock = sockets.get(conn.session_key);
@@ -1163,6 +1450,11 @@ function checkConnectionHealth(conn) {
 
   if (connectedSince && Date.now() - connectedSince < warmupMs) {
     return { ok: false, reason: "session_warmup" };
+  }
+
+  const localReadyAt = readyAt.get(conn.session_key) || 0;
+  if (!localReadyAt) {
+    return { ok: false, reason: "session_not_ready_checked" };
   }
 
   const remaining = unhealthyRemainingMs(conn.session_key);
@@ -1355,6 +1647,15 @@ async function sendOutboxRow(row) {
     const picked = await pickHealthyConnection(row);
     if (!picked.conn || !picked.sock) {
       lastRealtimeError = `primary_connection_unhealthy:${picked.reason || "no_healthy_connected_socket_available"}`;
+      log("outbox_waiting_connection_ready", {
+        outbox_id: row.id,
+        connection_id: row.wa_connection_id || null,
+        attempt,
+        total_attempts: totalAttempts,
+        reason: picked.reason || "no_healthy_connected_socket_available",
+        remaining_ms: picked.remaining_ms || 0,
+        detail: picked.detail || null,
+      });
       continue;
     }
 
@@ -1381,6 +1682,7 @@ async function sendOutboxRow(row) {
         );
         const messageId = sent && sent.key ? sent.key.id || null : null;
         const sentAt = nowIso();
+        rememberOutboundMessage(messageId, text);
 
         const { error } = await supabase
           .from("whatsapp_outbox")
@@ -1532,6 +1834,19 @@ async function bootstrap() {
     on_whatsapp_timeout_ms: ON_WHATSAPP_TIMEOUT_MS,
     send_message_timeout_ms: SEND_MESSAGE_TIMEOUT_MS,
     session_health_sync_ms: SESSION_HEALTH_SYNC_MS,
+    session_ready_after_seconds: SESSION_READY_AFTER_SECONDS,
+    ready_check_on_whatsapp: READY_CHECK_ON_WHATSAPP,
+    ready_check_timeout_ms: READY_CHECK_TIMEOUT_MS,
+    baileys_fire_init_queries: BAILEYS_FIRE_INIT_QUERIES,
+    baileys_fetch_latest_version: BAILEYS_FETCH_LATEST_VERSION,
+    baileys_connect_timeout_ms: BAILEYS_CONNECT_TIMEOUT_MS,
+    baileys_keep_alive_interval_ms: BAILEYS_KEEP_ALIVE_INTERVAL_MS,
+    baileys_default_query_timeout_ms: BAILEYS_DEFAULT_QUERY_TIMEOUT_MS,
+    baileys_retry_request_delay_ms: BAILEYS_RETRY_REQUEST_DELAY_MS,
+    baileys_max_msg_retry_count: BAILEYS_MAX_MSG_RETRY_COUNT,
+    baileys_enable_auto_session_recreation: BAILEYS_ENABLE_AUTO_SESSION_RECREATION,
+    baileys_enable_recent_message_cache: BAILEYS_ENABLE_RECENT_MESSAGE_CACHE,
+    baileys_emit_own_events: BAILEYS_EMIT_OWN_EVENTS,
     session_warmup_seconds: SESSION_WARMUP_SECONDS,
     session_send_concurrency: SESSION_SEND_CONCURRENCY,
     unhealthy_cooldown_seconds: UNHEALTHY_COOLDOWN_SECONDS,
