@@ -61,6 +61,7 @@ const WORKER_INSTANCE_ID = process.env.WORKER_INSTANCE_ID ||
   `${os.hostname()}-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 const WORKER_LOCK_TTL_SECONDS = Number(process.env.WORKER_LOCK_TTL_SECONDS || 60);
 const WORKER_LOCK_REQUIRED = String(process.env.WORKER_LOCK_REQUIRED || "false") === "true";
+const IGNORE_WORKER_LOCK_WHEN_OPTIONAL = String(process.env.IGNORE_WORKER_LOCK_WHEN_OPTIONAL || "true") === "true";
 const SESSION_SEND_CONCURRENCY = Number(process.env.SESSION_SEND_CONCURRENCY || 1);
 const CLEAN_ORPHAN_TOKENS = String(process.env.CLEAN_ORPHAN_TOKENS || "false") === "true";
 const ORPHAN_TOKEN_SCAN_MS = Number(process.env.ORPHAN_TOKEN_SCAN_MS || 300000);
@@ -570,6 +571,16 @@ async function ensureWorkerLock() {
       }
     }
 
+    if (!WORKER_LOCK_REQUIRED && IGNORE_WORKER_LOCK_WHEN_OPTIONAL) {
+      workerLockAcquired = true;
+      warn("worker_lock_rpc_error_single_instance_mode", {
+        instance_id: WORKER_INSTANCE_ID,
+        reason: error.message,
+        worker_lock_required: WORKER_LOCK_REQUIRED,
+      });
+      return true;
+    }
+
     if (workerLockAcquired) await stopSessionsBecauseLockLost();
     workerLockAcquired = false;
     log("worker_lock_not_acquired", {
@@ -580,6 +591,17 @@ async function ensureWorkerLock() {
   }
 
   const acquired = data === true;
+
+  if (!acquired && !WORKER_LOCK_REQUIRED && IGNORE_WORKER_LOCK_WHEN_OPTIONAL) {
+    if (!workerLockAcquired) {
+      warn("worker_lock_optional_not_acquired_single_instance_mode", {
+        instance_id: WORKER_INSTANCE_ID,
+        worker_lock_required: WORKER_LOCK_REQUIRED,
+      });
+    }
+    workerLockAcquired = true;
+    return true;
+  }
   if (acquired && !workerLockAcquired) {
     log("worker_lock_acquired", { instance_id: WORKER_INSTANCE_ID });
   }
@@ -1162,6 +1184,20 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   const attempts = code === 408
     ? incCounter(qrRestartCounts, sessionKey)
     : incCounter(closeRestartCounts, sessionKey);
+
+  // Quando o Baileys fecha sem statusCode logo após pareamento/aquecimento, isso costuma ser
+  // uma queda transitória. Não colocamos em sleeping aqui para não prender a conexão em pausa.
+  if (!code) {
+    await safeUpdateConn(sessionKey, {
+      status: "disconnected",
+      qr_base64: null,
+      last_seen: nowIso(),
+      status_reason: `close_unknown_retry_${attempts}`,
+    });
+    scheduleRestart(sessionKey, Math.min(CLOSE_RETRY_MS, 5000), `close_unknown_retry_${attempts}`);
+    return;
+  }
+
   const maxAttempts = code === 408 ? QR_MAX_RESTARTS : CLOSE_MAX_RESTARTS;
 
   if (attempts >= maxAttempts) {
@@ -1961,6 +1997,7 @@ async function bootstrap() {
     worker_instance_id: WORKER_INSTANCE_ID,
     worker_lock_ttl_seconds: WORKER_LOCK_TTL_SECONDS,
     worker_lock_required: WORKER_LOCK_REQUIRED,
+    ignore_worker_lock_when_optional: IGNORE_WORKER_LOCK_WHEN_OPTIONAL,
     refresh_sessions_ms: REFRESH_SESSIONS_MS,
     process_outbox_ms: PROCESS_OUTBOX_MS,
     outbox_batch: OUTBOX_BATCH,
@@ -2023,6 +2060,56 @@ async function bootstrap() {
     });
   }, SESSION_HEALTH_SYNC_MS);
 }
+
+
+function getErrorStatusCode(err) {
+  return err && err.output && err.output.statusCode ? err.output.statusCode : null;
+}
+
+function isKnownBaileysTransientProcessError(err) {
+  const message = String(err && err.message ? err.message : err || "");
+  const stack = String(err && err.stack ? err.stack : "");
+  const statusCode = getErrorStatusCode(err);
+  const combined = `${message}
+${stack}`;
+
+  return (
+    statusCode === 428 ||
+    statusCode === 408 ||
+    /Connection Closed|Precondition Required|sendRetryRequest|messages-recv|stream errored|restart required|Connection Terminated by Server|WebSocket was closed/i.test(combined)
+  );
+}
+
+function handleProcessLevelError(kind, err) {
+  const message = String(err && err.message ? err.message : err || "");
+  const stack = String(err && err.stack ? err.stack : "");
+  const statusCode = getErrorStatusCode(err);
+
+  if (isKnownBaileysTransientProcessError(err)) {
+    warn("baileys_process_transient_ignored", {
+      kind,
+      status_code: statusCode,
+      error: message.slice(0, 500),
+      stack: stack.slice(0, 1000),
+    });
+    return;
+  }
+
+  errorLog("worker_process_error", {
+    kind,
+    status_code: statusCode,
+    error: message.slice(0, 1000),
+    stack: stack.slice(0, 2000),
+  });
+}
+
+process.on("uncaughtException", (err) => {
+  handleProcessLevelError("uncaughtException", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  handleProcessLevelError("unhandledRejection", reason);
+});
 
 bootstrap().catch((err) => {
   errorLog("worker_bootstrap_failed", { error: String(err && err.message ? err.message : err) });
