@@ -43,7 +43,7 @@ const SESSION_READY_AFTER_SECONDS = Number(process.env.SESSION_READY_AFTER_SECON
 const READY_CHECK_ON_WHATSAPP = String(process.env.READY_CHECK_ON_WHATSAPP || "true") === "true";
 const READY_CHECK_TIMEOUT_MS = Number(process.env.READY_CHECK_TIMEOUT_MS || 15000);
 const BAILEYS_FIRE_INIT_QUERIES = String(process.env.BAILEYS_FIRE_INIT_QUERIES || "false") === "true";
-const BAILEYS_FETCH_LATEST_VERSION = String(process.env.BAILEYS_FETCH_LATEST_VERSION || "false") === "true";
+const BAILEYS_FETCH_LATEST_VERSION = String(process.env.BAILEYS_FETCH_LATEST_VERSION || "true") === "true";
 const BAILEYS_CONNECT_TIMEOUT_MS = Number(process.env.BAILEYS_CONNECT_TIMEOUT_MS || 60000);
 const BAILEYS_KEEP_ALIVE_INTERVAL_MS = Number(process.env.BAILEYS_KEEP_ALIVE_INTERVAL_MS || 25000);
 const BAILEYS_DEFAULT_QUERY_TIMEOUT_MS = Number(process.env.BAILEYS_DEFAULT_QUERY_TIMEOUT_MS || 60000);
@@ -55,6 +55,7 @@ const BAILEYS_EMIT_OWN_EVENTS = String(process.env.BAILEYS_EMIT_OWN_EVENTS || "t
 const WORKER_INSTANCE_ID = process.env.WORKER_INSTANCE_ID ||
   `${os.hostname()}-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 const WORKER_LOCK_TTL_SECONDS = Number(process.env.WORKER_LOCK_TTL_SECONDS || 60);
+const WORKER_LOCK_REQUIRED = String(process.env.WORKER_LOCK_REQUIRED || "false") === "true";
 const SESSION_SEND_CONCURRENCY = Number(process.env.SESSION_SEND_CONCURRENCY || 1);
 const CLEAN_ORPHAN_TOKENS = String(process.env.CLEAN_ORPHAN_TOKENS || "false") === "true";
 const ORPHAN_TOKEN_SCAN_MS = Number(process.env.ORPHAN_TOKEN_SCAN_MS || 300000);
@@ -193,6 +194,7 @@ function createBaileysLogger(sessionKey) {
   };
 
   const logger = {
+    level: "silent",
     trace: (...args) => write("trace", args),
     debug: (...args) => write("debug", args),
     info: (...args) => write("info", args),
@@ -200,6 +202,7 @@ function createBaileysLogger(sessionKey) {
     error: (...args) => write("error", args),
     fatal: (...args) => write("fatal", args),
     child: () => logger,
+    isLevelEnabled: () => false,
   };
 
   return logger;
@@ -476,13 +479,23 @@ async function stopSessionsBecauseLockLost() {
 
 async function ensureWorkerLock() {
   if (!workerLockRpcAvailable) {
-    if (workerLockAcquired) await stopSessionsBecauseLockLost();
-    workerLockAcquired = false;
-    log("worker_lock_not_acquired", {
+    if (WORKER_LOCK_REQUIRED) {
+      if (workerLockAcquired) await stopSessionsBecauseLockLost();
+      workerLockAcquired = false;
+      log("worker_lock_not_acquired", {
+        instance_id: WORKER_INSTANCE_ID,
+        reason: "try_acquire_wa_worker_lock_rpc_missing",
+        worker_lock_required: WORKER_LOCK_REQUIRED,
+      });
+      return false;
+    }
+
+    workerLockAcquired = true;
+    log("worker_lock_rpc_missing_single_instance_mode", {
       instance_id: WORKER_INSTANCE_ID,
-      reason: "try_acquire_wa_worker_lock_rpc_missing",
+      worker_lock_required: WORKER_LOCK_REQUIRED,
     });
-    return false;
+    return true;
   }
 
   const { data, error } = await supabase.rpc("try_acquire_wa_worker_lock", {
@@ -493,6 +506,14 @@ async function ensureWorkerLock() {
   if (error) {
     if (isMissingRpc(error, "try_acquire_wa_worker_lock")) {
       workerLockRpcAvailable = false;
+      if (!WORKER_LOCK_REQUIRED) {
+        workerLockAcquired = true;
+        log("worker_lock_rpc_missing_single_instance_mode", {
+          instance_id: WORKER_INSTANCE_ID,
+          worker_lock_required: WORKER_LOCK_REQUIRED,
+        });
+        return true;
+      }
     }
 
     if (workerLockAcquired) await stopSessionsBecauseLockLost();
@@ -1820,6 +1841,7 @@ async function bootstrap() {
     tokens_folder: TOKENS_FOLDER,
     worker_instance_id: WORKER_INSTANCE_ID,
     worker_lock_ttl_seconds: WORKER_LOCK_TTL_SECONDS,
+    worker_lock_required: WORKER_LOCK_REQUIRED,
     refresh_sessions_ms: REFRESH_SESSIONS_MS,
     process_outbox_ms: PROCESS_OUTBOX_MS,
     outbox_batch: OUTBOX_BATCH,
