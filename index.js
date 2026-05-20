@@ -45,7 +45,10 @@ const SESSION_READY_AFTER_SECONDS = Number(process.env.SESSION_READY_AFTER_SECON
 const READY_CHECK_ON_WHATSAPP = String(process.env.READY_CHECK_ON_WHATSAPP || "true") === "true";
 const READY_CHECK_TIMEOUT_MS = Number(process.env.READY_CHECK_TIMEOUT_MS || 15000);
 const BAILEYS_FIRE_INIT_QUERIES = String(process.env.BAILEYS_FIRE_INIT_QUERIES || "false") === "true";
+// IMPORTANTE: a env antiga BAILEYS_FETCH_LATEST_VERSION=false causou erro 405 em algumas conexões.
+// Agora o worker busca a versão atual por padrão. Para desligar, use BAILEYS_DISABLE_FETCH_LATEST_VERSION=true.
 const BAILEYS_DISABLE_FETCH_LATEST_VERSION = String(process.env.BAILEYS_DISABLE_FETCH_LATEST_VERSION || "false") === "true";
+const BAILEYS_FETCH_LATEST_VERSION = !BAILEYS_DISABLE_FETCH_LATEST_VERSION;
 const BAILEYS_CONNECT_TIMEOUT_MS = Number(process.env.BAILEYS_CONNECT_TIMEOUT_MS || 60000);
 const BAILEYS_KEEP_ALIVE_INTERVAL_MS = Number(process.env.BAILEYS_KEEP_ALIVE_INTERVAL_MS || 25000);
 const BAILEYS_DEFAULT_QUERY_TIMEOUT_MS = Number(process.env.BAILEYS_DEFAULT_QUERY_TIMEOUT_MS || 60000);
@@ -61,8 +64,6 @@ const WORKER_LOCK_REQUIRED = String(process.env.WORKER_LOCK_REQUIRED || "false")
 const SESSION_SEND_CONCURRENCY = Number(process.env.SESSION_SEND_CONCURRENCY || 1);
 const CLEAN_ORPHAN_TOKENS = String(process.env.CLEAN_ORPHAN_TOKENS || "false") === "true";
 const ORPHAN_TOKEN_SCAN_MS = Number(process.env.ORPHAN_TOKEN_SCAN_MS || 300000);
-const DISCONNECTED_AUTO_START_MAX_AGE_MINUTES = Number(process.env.DISCONNECTED_AUTO_START_MAX_AGE_MINUTES || 20);
-const SKIP_OLD_DISCONNECTED_SESSIONS = String(process.env.SKIP_OLD_DISCONNECTED_SESSIONS || "false") === "true";
 const MAX_SESSION_STARTS_PER_REFRESH = Number(process.env.MAX_SESSION_STARTS_PER_REFRESH || 3);
 const SESSION_START_SPACING_MS = Number(process.env.SESSION_START_SPACING_MS || 1500);
 
@@ -76,8 +77,11 @@ const STATUS_SLEEPING = "sleeping";
 const CONNECTION_ERROR_WINDOW_SECONDS = Number(process.env.CONNECTION_ERROR_WINDOW_SECONDS || 300);
 const CONNECTION_ERROR_SLEEP_THRESHOLD = Number(process.env.CONNECTION_ERROR_SLEEP_THRESHOLD || 5);
 
-const HEALTH_ERROR_RE = /(405|408|428|500|503|515|timed out|timeout|messagecountererror|stream:error|stream errored|connection terminated|connection errored|init queries)/i;
-const UNHEALTHY_CLOSE_CODES = new Set([405, 408, 428, 500, 503, 515]);
+const HEALTH_ERROR_RE = /(408|428|500|503|timed out|timeout|messagecountererror|connection terminated|connection errored|init queries)/i;
+const UNHEALTHY_CLOSE_CODES = new Set([408, 428, 500, 503]);
+// No Baileys, o close/stream 515 normalmente significa "restart required" após pareamento/login.
+// Não é motivo para pausar a conexão; o correto é reiniciar o socket usando as credenciais recém-salvas.
+const RESTART_REQUIRED_RE = /(\b515\b|restart required|stream errored)/i;
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -163,17 +167,20 @@ function withTimeout(promise, timeoutMs, label) {
   });
 }
 
-function getBaileysBrowser() {
-  if (Browsers && typeof Browsers.ubuntu === "function") {
-    return Browsers.ubuntu("Chrome");
-  }
-
-  return ["Ubuntu", "Chrome", "22.04.4"];
-}
-
 function isTemporaryRealtimeError(err) {
   const message = String(err && err.message ? err.message : err || "");
-  return /(405|408|500|503|timed out|timeout|stream:error|stream errored|connection|socket|closed|not open|messagecountererror)/i.test(message);
+  return /(408|500|503|timed out|timeout|stream:error|stream errored|connection|socket|closed|not open|messagecountererror)/i.test(message);
+}
+
+function isRestartRequiredReason(value) {
+  return RESTART_REQUIRED_RE.test(String(value && value.message ? value.message : value || ""));
+}
+
+function isConnectionHealthReason(value) {
+  const text = String(value && value.message ? value.message : value || "");
+  if (!text) return false;
+  if (isRestartRequiredReason(text)) return false;
+  return HEALTH_ERROR_RE.test(text);
 }
 
 function createBaileysLogger(sessionKey) {
@@ -201,7 +208,12 @@ function createBaileysLogger(sessionKey) {
       warn("baileys_internal_warn", payload);
     }
 
-    if (HEALTH_ERROR_RE.test(text)) {
+    if (isRestartRequiredReason(text)) {
+      log("baileys_restart_required", { session_key: sessionKey, level });
+      return;
+    }
+
+    if (isConnectionHealthReason(text)) {
       setTimeout(() => {
         registerConnectionError(sessionKey, text.slice(0, 500), {
           source: "baileys_logger",
@@ -385,16 +397,35 @@ function markUnhealthy(sessionKey, reason) {
 
 function markUnhealthyFromError(sessionKey, err) {
   const msg = String(err && err.message ? err.message : err || "");
-  if (HEALTH_ERROR_RE.test(msg)) markUnhealthy(sessionKey, msg);
+  if (isConnectionHealthReason(msg)) markUnhealthy(sessionKey, msg);
 }
 
 async function registerConnectionError(sessionKey, reason, details = {}) {
   if (!sessionKey) return;
 
   const textReason = String(reason || "unknown_error");
-  if (HEALTH_ERROR_RE.test(textReason)) {
-    markUnhealthy(sessionKey, textReason);
+
+  if (isRestartRequiredReason(textReason)) {
+    readyAt.delete(sessionKey);
+    clearReadyTimer(sessionKey);
+    await safeUpdateConn(sessionKey, {
+      status: "connecting",
+      last_seen: nowIso(),
+      status_reason: "restart_required_515_reconnecting",
+    });
+    const conn = await getConnectionBySessionKey(sessionKey);
+    await recordHealthLog(conn || { session_key: sessionKey }, "restart_required_515", textReason, safeDetails(details));
+    scheduleRestart(sessionKey, 2000, "restart_required_515");
+    return;
   }
+
+  if (!isConnectionHealthReason(textReason)) {
+    const conn = await getConnectionBySessionKey(sessionKey);
+    await recordHealthLog(conn || { session_key: sessionKey }, "baileys_non_health_event", textReason, safeDetails(details));
+    return;
+  }
+
+  markUnhealthy(sessionKey, textReason);
 
   readyAt.delete(sessionKey);
   clearReadyTimer(sessionKey);
@@ -441,7 +472,7 @@ function unhealthyRemainingMs(sessionKey) {
 async function getConnectionBySessionKey(sessionKey) {
   const { data, error } = await supabase
     .from("wa_connections")
-    .select("id, created_at, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
+    .select("id, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
     .eq("session_key", sessionKey)
     .maybeSingle();
 
@@ -565,7 +596,7 @@ async function ensureWorkerLock() {
 async function refreshConnectionsCache() {
   const { data, error } = await supabase
     .from("wa_connections")
-    .select("id, created_at, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
+    .select("id, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
     .is("deleted_at", null)
     .order("created_at", { ascending: true });
 
@@ -575,48 +606,6 @@ async function refreshConnectionsCache() {
   }
 
   connections = data || [];
-}
-
-function shouldAutoStartConnection(connection) {
-  if (!connection || !connection.session_key) {
-    return { ok: false, reason: "missing_session_key" };
-  }
-
-  if (connection.deleted_at) {
-    return { ok: false, reason: "deleted_connection" };
-  }
-
-  const status = String(connection.status || "").toLowerCase();
-  if (status === STATUS_SLEEPING) {
-    return { ok: false, reason: STATUS_SLEEPING };
-  }
-
-  if (!status || status === "connecting" || status === "qr_ready" || status === STATUS_WARMING_UP || status === STATUS_CONNECTED || status === "logged_out") {
-    return { ok: true, reason: "active_status" };
-  }
-
-  if (status === "disconnected" || status === "error") {
-    if (!SKIP_OLD_DISCONNECTED_SESSIONS) {
-      return { ok: true, reason: `${status}_allowed` };
-    }
-
-    const createdAtMs = connection.created_at ? Date.parse(connection.created_at) : 0;
-    const isRecent = createdAtMs > 0 && Date.now() - createdAtMs <= DISCONNECTED_AUTO_START_MAX_AGE_MINUTES * 60 * 1000;
-    const hasNoFailureReason = !String(connection.status_reason || "").trim();
-    const hasNeverConnected = !connection.phone_number && !connection.wa_jid && !connection.last_connected_at;
-
-    if (isRecent || (hasNeverConnected && hasNoFailureReason)) {
-      return { ok: true, reason: isRecent ? "recent_connection" : "new_connection_without_failure" };
-    }
-
-    return {
-      ok: false,
-      reason: `${status}_not_recent`,
-      age_minutes: createdAtMs > 0 ? Math.round((Date.now() - createdAtMs) / 60000) : null,
-    };
-  }
-
-  return { ok: true, reason: "unhandled_status" };
 }
 
 function isSafeChildPath(parent, child) {
@@ -871,6 +860,19 @@ function scheduleReadyCheck(sessionKey, sock, delayMs, reason) {
 async function markSleeping(sessionKey, reason) {
   readyAt.delete(sessionKey);
   clearReadyTimer(sessionKey);
+  clearRestartTimer(sessionKey);
+
+  const sock = sockets.get(sessionKey);
+  if (sock) {
+    intentionalStops.add(sessionKey);
+    sockets.delete(sessionKey);
+    starting.delete(sessionKey);
+    try {
+      if (typeof sock.end === "function") sock.end(new Error("session_sleeping"));
+    } catch (err) {
+      warn("socket_end_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
+    }
+  }
 
   await safeUpdateConn(sessionKey, {
     status: STATUS_SLEEPING,
@@ -915,7 +917,11 @@ async function stopSession(
 ) {
   const sock = sockets.get(sessionKey);
 
-  if (markIntentional) intentionalStops.add(sessionKey);
+  if (markIntentional && sock) {
+    intentionalStops.add(sessionKey);
+  } else if (!sock) {
+    intentionalStops.delete(sessionKey);
+  }
 
   clearRestartTimer(sessionKey);
   clearReadyTimer(sessionKey);
@@ -992,24 +998,17 @@ async function startSession(sessionKey) {
       keepAliveIntervalMs: BAILEYS_KEEP_ALIVE_INTERVAL_MS,
       defaultQueryTimeoutMs: BAILEYS_DEFAULT_QUERY_TIMEOUT_MS,
       markOnlineOnConnect: false,
-      browser: getBaileysBrowser(),
+      browser: Browsers && typeof Browsers.ubuntu === "function"
+        ? Browsers.ubuntu("Chrome")
+        : ["Ubuntu", "Chrome", "1.0"],
       getMessage: getMessageForRetry,
       shouldSyncHistoryMessage: () => false,
     };
 
-    if (!BAILEYS_DISABLE_FETCH_LATEST_VERSION) {
-      try {
-        const { version } = await fetchLatestBaileysVersion();
-        socketConfig.version = version;
-        log("baileys_version_selected", { session_key: sessionKey, version });
-      } catch (err) {
-        warn("baileys_version_fetch_failed", {
-          session_key: sessionKey,
-          error: String(err && err.message ? err.message : err),
-        });
-      }
-    } else {
-      warn("baileys_version_fetch_disabled", { session_key: sessionKey });
+    if (BAILEYS_FETCH_LATEST_VERSION) {
+      const { version } = await fetchLatestBaileysVersion();
+      socketConfig.version = version;
+      log("baileys_version_selected", { session_key: sessionKey, version });
     }
 
     const sock = makeWASocket(socketConfig);
@@ -1067,6 +1066,9 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   const reason = code == null ? "unknown" : String(code);
 
   if (qr) {
+    connectionErrorHistory.delete(sessionKey);
+    unhealthyUntil.delete(sessionKey);
+    unhealthyReason.delete(sessionKey);
     const dataUrl = await qrcode.toDataURL(qr);
     await safeUpdateConn(sessionKey, {
       status: "qr_ready",
@@ -1095,12 +1097,36 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   readyAt.delete(sessionKey);
   clearReadyTimer(sessionKey);
 
+  log("disconnected", { session_key: sessionKey, code: code || null });
+
+  if (code === 515 || isRestartRequiredReason(lastDisconnect && lastDisconnect.error)) {
+    const disconnectedRow = await getConnectionBySessionKey(sessionKey);
+    await recordHealthLog(disconnectedRow || { session_key: sessionKey }, "restart_required_515", "restart_required_after_login", {
+      code: code || null,
+    });
+
+    // O 515 é o reinício normal exigido pelo WhatsApp/Baileys após o pareamento.
+    // Mesmo se houver uma flag intentionalStops atrasada de um socket antigo, não devemos engolir esse restart.
+    intentionalStops.delete(sessionKey);
+
+    const stillActive = await getConnectionBySessionKey(sessionKey);
+    if (!stillActive || stillActive.deleted_at || stillActive.status === STATUS_SLEEPING) return;
+
+    await safeUpdateConn(sessionKey, {
+      status: "connecting",
+      qr_base64: null,
+      last_seen: nowIso(),
+      status_reason: "restart_required_515_reconnecting",
+    });
+
+    scheduleRestart(sessionKey, 2000, "restart_required_515");
+    return;
+  }
+
   if (code && UNHEALTHY_CLOSE_CODES.has(Number(code))) {
     markUnhealthy(sessionKey, `close_${code}`);
     await registerConnectionError(sessionKey, `close_${code}`, { source: "connection.update" });
   }
-
-  log("disconnected", { session_key: sessionKey, code: code || null });
 
   const disconnectedRow = await getConnectionBySessionKey(sessionKey);
   await recordHealthLog(disconnectedRow || { session_key: sessionKey }, "disconnected", reason, {
@@ -1133,11 +1159,10 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
     return;
   }
 
-  const isHandshakeClose = code === 408 || code === 405;
-  const attempts = isHandshakeClose
+  const attempts = code === 408
     ? incCounter(qrRestartCounts, sessionKey)
     : incCounter(closeRestartCounts, sessionKey);
-  const maxAttempts = isHandshakeClose ? QR_MAX_RESTARTS : CLOSE_MAX_RESTARTS;
+  const maxAttempts = code === 408 ? QR_MAX_RESTARTS : CLOSE_MAX_RESTARTS;
 
   if (attempts >= maxAttempts) {
     await markSleeping(sessionKey, `closed_${reason}_after_${attempts}_tries`);
@@ -1272,19 +1297,6 @@ async function refreshSessions() {
         continue;
       }
 
-      const autoStart = shouldAutoStartConnection(connection);
-      if (!autoStart.ok) {
-        clearRestartTimer(connection.session_key);
-        log("start_session_skipped", {
-          connection_id: connection.id || null,
-          session_key: connection.session_key,
-          status: connection.status || null,
-          reason: autoStart.reason,
-          age_minutes: autoStart.age_minutes == null ? null : autoStart.age_minutes,
-        });
-        continue;
-      }
-
       if (connection.status === "logged_out") {
         await stopSession(connection.session_key, {
           clearCreds: true,
@@ -1292,20 +1304,19 @@ async function refreshSessions() {
           markIntentional: true,
           reason: "logged_out_reset",
         });
-        intentionalStops.delete(connection.session_key);
+        // Não remova intentionalStops aqui. O evento close do socket antigo pode chegar atrasado.
+        // handleConnectionUpdate limpa essa flag com segurança, ou a próxima abertura limpa no connection=open.
       }
 
       if (!sockets.has(connection.session_key) && !starting.has(connection.session_key)) {
         if (startsThisRefresh >= MAX_SESSION_STARTS_PER_REFRESH) {
-          log("start_session_deferred", {
-            connection_id: connection.id || null,
+          log("session_start_deferred", {
             session_key: connection.session_key,
             reason: "max_session_starts_per_refresh",
             max_session_starts_per_refresh: MAX_SESSION_STARTS_PER_REFRESH,
           });
           continue;
         }
-
         startsThisRefresh += 1;
         if (startsThisRefresh > 1 && SESSION_START_SPACING_MS > 0) {
           await sleep(SESSION_START_SPACING_MS);
@@ -1969,6 +1980,7 @@ async function bootstrap() {
     ready_check_timeout_ms: READY_CHECK_TIMEOUT_MS,
     baileys_fire_init_queries: BAILEYS_FIRE_INIT_QUERIES,
     baileys_disable_fetch_latest_version: BAILEYS_DISABLE_FETCH_LATEST_VERSION,
+    baileys_fetch_latest_version: BAILEYS_FETCH_LATEST_VERSION,
     baileys_connect_timeout_ms: BAILEYS_CONNECT_TIMEOUT_MS,
     baileys_keep_alive_interval_ms: BAILEYS_KEEP_ALIVE_INTERVAL_MS,
     baileys_default_query_timeout_ms: BAILEYS_DEFAULT_QUERY_TIMEOUT_MS,
@@ -1985,8 +1997,6 @@ async function bootstrap() {
     close_retry_ms: CLOSE_RETRY_MS,
     close_max_restarts: CLOSE_MAX_RESTARTS,
     clean_orphan_tokens: CLEAN_ORPHAN_TOKENS,
-    disconnected_auto_start_max_age_minutes: DISCONNECTED_AUTO_START_MAX_AGE_MINUTES,
-    skip_old_disconnected_sessions: SKIP_OLD_DISCONNECTED_SESSIONS,
     max_session_starts_per_refresh: MAX_SESSION_STARTS_PER_REFRESH,
     session_start_spacing_ms: SESSION_START_SPACING_MS,
   });
