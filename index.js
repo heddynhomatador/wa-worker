@@ -8,6 +8,7 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   jidNormalizedUser,
+  Browsers,
 } = require("@whiskeysockets/baileys");
 const fs = require("fs");
 const path = require("path");
@@ -44,7 +45,7 @@ const SESSION_READY_AFTER_SECONDS = Number(process.env.SESSION_READY_AFTER_SECON
 const READY_CHECK_ON_WHATSAPP = String(process.env.READY_CHECK_ON_WHATSAPP || "true") === "true";
 const READY_CHECK_TIMEOUT_MS = Number(process.env.READY_CHECK_TIMEOUT_MS || 15000);
 const BAILEYS_FIRE_INIT_QUERIES = String(process.env.BAILEYS_FIRE_INIT_QUERIES || "false") === "true";
-const BAILEYS_FETCH_LATEST_VERSION = String(process.env.BAILEYS_FETCH_LATEST_VERSION || "true") === "true";
+const BAILEYS_DISABLE_FETCH_LATEST_VERSION = String(process.env.BAILEYS_DISABLE_FETCH_LATEST_VERSION || "false") === "true";
 const BAILEYS_CONNECT_TIMEOUT_MS = Number(process.env.BAILEYS_CONNECT_TIMEOUT_MS || 60000);
 const BAILEYS_KEEP_ALIVE_INTERVAL_MS = Number(process.env.BAILEYS_KEEP_ALIVE_INTERVAL_MS || 25000);
 const BAILEYS_DEFAULT_QUERY_TIMEOUT_MS = Number(process.env.BAILEYS_DEFAULT_QUERY_TIMEOUT_MS || 60000);
@@ -60,6 +61,10 @@ const WORKER_LOCK_REQUIRED = String(process.env.WORKER_LOCK_REQUIRED || "false")
 const SESSION_SEND_CONCURRENCY = Number(process.env.SESSION_SEND_CONCURRENCY || 1);
 const CLEAN_ORPHAN_TOKENS = String(process.env.CLEAN_ORPHAN_TOKENS || "false") === "true";
 const ORPHAN_TOKEN_SCAN_MS = Number(process.env.ORPHAN_TOKEN_SCAN_MS || 300000);
+const DISCONNECTED_AUTO_START_MAX_AGE_MINUTES = Number(process.env.DISCONNECTED_AUTO_START_MAX_AGE_MINUTES || 20);
+const SKIP_OLD_DISCONNECTED_SESSIONS = String(process.env.SKIP_OLD_DISCONNECTED_SESSIONS || "false") === "true";
+const MAX_SESSION_STARTS_PER_REFRESH = Number(process.env.MAX_SESSION_STARTS_PER_REFRESH || 3);
+const SESSION_START_SPACING_MS = Number(process.env.SESSION_START_SPACING_MS || 1500);
 
 const QR_RETRY_MS = Number(process.env.QR_RETRY_MS || 60000);
 const QR_MAX_RESTARTS = Number(process.env.QR_MAX_RESTARTS || 3);
@@ -71,8 +76,8 @@ const STATUS_SLEEPING = "sleeping";
 const CONNECTION_ERROR_WINDOW_SECONDS = Number(process.env.CONNECTION_ERROR_WINDOW_SECONDS || 300);
 const CONNECTION_ERROR_SLEEP_THRESHOLD = Number(process.env.CONNECTION_ERROR_SLEEP_THRESHOLD || 5);
 
-const HEALTH_ERROR_RE = /(408|428|500|503|515|timed out|timeout|messagecountererror|stream:error|stream errored|connection terminated|connection errored|init queries)/i;
-const UNHEALTHY_CLOSE_CODES = new Set([408, 428, 500, 503, 515]);
+const HEALTH_ERROR_RE = /(405|408|428|500|503|515|timed out|timeout|messagecountererror|stream:error|stream errored|connection terminated|connection errored|init queries)/i;
+const UNHEALTHY_CLOSE_CODES = new Set([405, 408, 428, 500, 503, 515]);
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -158,9 +163,17 @@ function withTimeout(promise, timeoutMs, label) {
   });
 }
 
+function getBaileysBrowser() {
+  if (Browsers && typeof Browsers.ubuntu === "function") {
+    return Browsers.ubuntu("Chrome");
+  }
+
+  return ["Ubuntu", "Chrome", "22.04.4"];
+}
+
 function isTemporaryRealtimeError(err) {
   const message = String(err && err.message ? err.message : err || "");
-  return /(408|500|503|timed out|timeout|stream:error|stream errored|connection|socket|closed|not open|messagecountererror)/i.test(message);
+  return /(405|408|500|503|timed out|timeout|stream:error|stream errored|connection|socket|closed|not open|messagecountererror)/i.test(message);
 }
 
 function createBaileysLogger(sessionKey) {
@@ -428,7 +441,7 @@ function unhealthyRemainingMs(sessionKey) {
 async function getConnectionBySessionKey(sessionKey) {
   const { data, error } = await supabase
     .from("wa_connections")
-    .select("id, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
+    .select("id, created_at, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
     .eq("session_key", sessionKey)
     .maybeSingle();
 
@@ -552,7 +565,7 @@ async function ensureWorkerLock() {
 async function refreshConnectionsCache() {
   const { data, error } = await supabase
     .from("wa_connections")
-    .select("id, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
+    .select("id, created_at, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
     .is("deleted_at", null)
     .order("created_at", { ascending: true });
 
@@ -562,6 +575,48 @@ async function refreshConnectionsCache() {
   }
 
   connections = data || [];
+}
+
+function shouldAutoStartConnection(connection) {
+  if (!connection || !connection.session_key) {
+    return { ok: false, reason: "missing_session_key" };
+  }
+
+  if (connection.deleted_at) {
+    return { ok: false, reason: "deleted_connection" };
+  }
+
+  const status = String(connection.status || "").toLowerCase();
+  if (status === STATUS_SLEEPING) {
+    return { ok: false, reason: STATUS_SLEEPING };
+  }
+
+  if (!status || status === "connecting" || status === "qr_ready" || status === STATUS_WARMING_UP || status === STATUS_CONNECTED || status === "logged_out") {
+    return { ok: true, reason: "active_status" };
+  }
+
+  if (status === "disconnected" || status === "error") {
+    if (!SKIP_OLD_DISCONNECTED_SESSIONS) {
+      return { ok: true, reason: `${status}_allowed` };
+    }
+
+    const createdAtMs = connection.created_at ? Date.parse(connection.created_at) : 0;
+    const isRecent = createdAtMs > 0 && Date.now() - createdAtMs <= DISCONNECTED_AUTO_START_MAX_AGE_MINUTES * 60 * 1000;
+    const hasNoFailureReason = !String(connection.status_reason || "").trim();
+    const hasNeverConnected = !connection.phone_number && !connection.wa_jid && !connection.last_connected_at;
+
+    if (isRecent || (hasNeverConnected && hasNoFailureReason)) {
+      return { ok: true, reason: isRecent ? "recent_connection" : "new_connection_without_failure" };
+    }
+
+    return {
+      ok: false,
+      reason: `${status}_not_recent`,
+      age_minutes: createdAtMs > 0 ? Math.round((Date.now() - createdAtMs) / 60000) : null,
+    };
+  }
+
+  return { ok: true, reason: "unhandled_status" };
 }
 
 function isSafeChildPath(parent, child) {
@@ -937,14 +992,24 @@ async function startSession(sessionKey) {
       keepAliveIntervalMs: BAILEYS_KEEP_ALIVE_INTERVAL_MS,
       defaultQueryTimeoutMs: BAILEYS_DEFAULT_QUERY_TIMEOUT_MS,
       markOnlineOnConnect: false,
-      browser: ["URA Connect Hub", "Chrome", "1.0"],
+      browser: getBaileysBrowser(),
       getMessage: getMessageForRetry,
       shouldSyncHistoryMessage: () => false,
     };
 
-    if (BAILEYS_FETCH_LATEST_VERSION) {
-      const { version } = await fetchLatestBaileysVersion();
-      socketConfig.version = version;
+    if (!BAILEYS_DISABLE_FETCH_LATEST_VERSION) {
+      try {
+        const { version } = await fetchLatestBaileysVersion();
+        socketConfig.version = version;
+        log("baileys_version_selected", { session_key: sessionKey, version });
+      } catch (err) {
+        warn("baileys_version_fetch_failed", {
+          session_key: sessionKey,
+          error: String(err && err.message ? err.message : err),
+        });
+      }
+    } else {
+      warn("baileys_version_fetch_disabled", { session_key: sessionKey });
     }
 
     const sock = makeWASocket(socketConfig);
@@ -1068,10 +1133,11 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
     return;
   }
 
-  const attempts = code === 408
+  const isHandshakeClose = code === 408 || code === 405;
+  const attempts = isHandshakeClose
     ? incCounter(qrRestartCounts, sessionKey)
     : incCounter(closeRestartCounts, sessionKey);
-  const maxAttempts = code === 408 ? QR_MAX_RESTARTS : CLOSE_MAX_RESTARTS;
+  const maxAttempts = isHandshakeClose ? QR_MAX_RESTARTS : CLOSE_MAX_RESTARTS;
 
   if (attempts >= maxAttempts) {
     await markSleeping(sessionKey, `closed_${reason}_after_${attempts}_tries`);
@@ -1196,11 +1262,26 @@ async function refreshSessions() {
       }
     }
 
+    let startsThisRefresh = 0;
+
     for (const connection of connections) {
       if (!connection || !connection.session_key) continue;
 
       if (connection.status === STATUS_SLEEPING) {
         clearRestartTimer(connection.session_key);
+        continue;
+      }
+
+      const autoStart = shouldAutoStartConnection(connection);
+      if (!autoStart.ok) {
+        clearRestartTimer(connection.session_key);
+        log("start_session_skipped", {
+          connection_id: connection.id || null,
+          session_key: connection.session_key,
+          status: connection.status || null,
+          reason: autoStart.reason,
+          age_minutes: autoStart.age_minutes == null ? null : autoStart.age_minutes,
+        });
         continue;
       }
 
@@ -1212,6 +1293,23 @@ async function refreshSessions() {
           reason: "logged_out_reset",
         });
         intentionalStops.delete(connection.session_key);
+      }
+
+      if (!sockets.has(connection.session_key) && !starting.has(connection.session_key)) {
+        if (startsThisRefresh >= MAX_SESSION_STARTS_PER_REFRESH) {
+          log("start_session_deferred", {
+            connection_id: connection.id || null,
+            session_key: connection.session_key,
+            reason: "max_session_starts_per_refresh",
+            max_session_starts_per_refresh: MAX_SESSION_STARTS_PER_REFRESH,
+          });
+          continue;
+        }
+
+        startsThisRefresh += 1;
+        if (startsThisRefresh > 1 && SESSION_START_SPACING_MS > 0) {
+          await sleep(SESSION_START_SPACING_MS);
+        }
       }
 
       await startSession(connection.session_key);
@@ -1870,7 +1968,7 @@ async function bootstrap() {
     ready_check_on_whatsapp: READY_CHECK_ON_WHATSAPP,
     ready_check_timeout_ms: READY_CHECK_TIMEOUT_MS,
     baileys_fire_init_queries: BAILEYS_FIRE_INIT_QUERIES,
-    baileys_fetch_latest_version: BAILEYS_FETCH_LATEST_VERSION,
+    baileys_disable_fetch_latest_version: BAILEYS_DISABLE_FETCH_LATEST_VERSION,
     baileys_connect_timeout_ms: BAILEYS_CONNECT_TIMEOUT_MS,
     baileys_keep_alive_interval_ms: BAILEYS_KEEP_ALIVE_INTERVAL_MS,
     baileys_default_query_timeout_ms: BAILEYS_DEFAULT_QUERY_TIMEOUT_MS,
@@ -1887,6 +1985,10 @@ async function bootstrap() {
     close_retry_ms: CLOSE_RETRY_MS,
     close_max_restarts: CLOSE_MAX_RESTARTS,
     clean_orphan_tokens: CLEAN_ORPHAN_TOKENS,
+    disconnected_auto_start_max_age_minutes: DISCONNECTED_AUTO_START_MAX_AGE_MINUTES,
+    skip_old_disconnected_sessions: SKIP_OLD_DISCONNECTED_SESSIONS,
+    max_session_starts_per_refresh: MAX_SESSION_STARTS_PER_REFRESH,
+    session_start_spacing_ms: SESSION_START_SPACING_MS,
   });
 
   await refreshSessions();
