@@ -72,14 +72,20 @@ const QR_RETRY_MS = Number(process.env.QR_RETRY_MS || 60000);
 const QR_MAX_RESTARTS = Number(process.env.QR_MAX_RESTARTS || 3);
 const CLOSE_RETRY_MS = Number(process.env.CLOSE_RETRY_MS || 15000);
 const CLOSE_MAX_RESTARTS = Number(process.env.CLOSE_MAX_RESTARTS || 5);
+// Enquanto estamos estabilizando sessões Baileys, não pausamos automaticamente por rajadas de erro.
+// Pausar por threshold estava prendendo sessões boas logo após o QR, por causa de sync/history/retry interno.
+const DISABLE_AUTO_SLEEP_ON_RECENT_ERRORS = String(process.env.DISABLE_AUTO_SLEEP_ON_RECENT_ERRORS || "true") === "true";
+const IGNORE_BAILEYS_SYNC_NOISE = String(process.env.IGNORE_BAILEYS_SYNC_NOISE || "true") === "true";
 const STATUS_WARMING_UP = "warming_up";
 const STATUS_CONNECTED = "connected";
 const STATUS_SLEEPING = "sleeping";
 const CONNECTION_ERROR_WINDOW_SECONDS = Number(process.env.CONNECTION_ERROR_WINDOW_SECONDS || 300);
-const CONNECTION_ERROR_SLEEP_THRESHOLD = Number(process.env.CONNECTION_ERROR_SLEEP_THRESHOLD || 5);
+const CONNECTION_ERROR_SLEEP_THRESHOLD = Number(process.env.CONNECTION_ERROR_SLEEP_THRESHOLD || 50);
 
-const HEALTH_ERROR_RE = /(408|428|500|503|timed out|timeout|messagecountererror|connection terminated|connection errored|init queries)/i;
-const UNHEALTHY_CLOSE_CODES = new Set([408, 428, 500, 503]);
+const HEALTH_ERROR_RE = /(408|500|503|timed out|timeout|messagecountererror|connection terminated|connection errored|init queries)/i;
+// 428 geralmente aparece quando o Baileys tenta responder retry/decrypt depois que o socket já fechou.
+// Isso deve reiniciar, não jogar em sleeping.
+const UNHEALTHY_CLOSE_CODES = new Set([408, 500, 503]);
 // No Baileys, o close/stream 515 normalmente significa "restart required" após pareamento/login.
 // Não é motivo para pausar a conexão; o correto é reiniciar o socket usando as credenciais recém-salvas.
 const RESTART_REQUIRED_RE = /(\b515\b|restart required|stream errored)/i;
@@ -177,11 +183,27 @@ function isRestartRequiredReason(value) {
   return RESTART_REQUIRED_RE.test(String(value && value.message ? value.message : value || ""));
 }
 
+function isIgnorableBaileysNoise(value) {
+  if (!IGNORE_BAILEYS_SYNC_NOISE) return false;
+  const text = String(value && value.message ? value.message : value || "");
+  if (!text) return false;
+
+  return /(syncAction|histNotification|failed to decrypt message|status@broadcast|session_sleeping|logged_out_reset|Connection Closed|Precondition Required|sendRetryRequest)/i.test(text);
+}
+
 function isConnectionHealthReason(value) {
   const text = String(value && value.message ? value.message : value || "");
   if (!text) return false;
   if (isRestartRequiredReason(text)) return false;
+  if (isIgnorableBaileysNoise(text)) return false;
   return HEALTH_ERROR_RE.test(text);
+}
+
+function isRecoverableBaileysProcessError(value) {
+  const text = String(value && value.stack ? value.stack : value && value.message ? value.message : value || "");
+  const code = value && value.output ? value.output.statusCode : null;
+  if (code === 428 || code === 408 || code === 515) return true;
+  return /(Connection Closed|Precondition Required|sendRetryRequest|Stream Errored|restart required|Connection Terminated)/i.test(text);
 }
 
 function createBaileysLogger(sessionKey) {
@@ -455,6 +477,31 @@ async function registerConnectionError(sessionKey, reason, details = {}) {
   });
 
   if (history.length >= CONNECTION_ERROR_SLEEP_THRESHOLD) {
+    if (DISABLE_AUTO_SLEEP_ON_RECENT_ERRORS) {
+      warn("session_recent_errors_autosleep_disabled", {
+        session_key: sessionKey,
+        reason: textReason.slice(0, 180),
+        errors_in_window: history.length,
+        threshold: CONNECTION_ERROR_SLEEP_THRESHOLD,
+      });
+
+      connectionErrorHistory.set(sessionKey, history.slice(-Math.max(1, Math.floor(CONNECTION_ERROR_SLEEP_THRESHOLD / 2))));
+
+      const sock = sockets.get(sessionKey);
+      if (sock && sock.user) {
+        scheduleReadyCheck(sessionKey, sock, Math.min(UNHEALTHY_COOLDOWN_SECONDS * 1000, 30000), "recent_error_cooldown_no_sleep");
+      } else {
+        await safeUpdateConn(sessionKey, {
+          status: "disconnected",
+          qr_base64: null,
+          last_seen: nowIso(),
+          status_reason: `recent_errors_restart_no_sleep:${textReason.slice(0, 120)}`,
+        });
+        scheduleRestart(sessionKey, Math.min(CLOSE_RETRY_MS, 10000), "recent_errors_restart_no_sleep");
+      }
+      return;
+    }
+
     await markSleeping(sessionKey, `too_many_recent_errors:${textReason.slice(0, 120)}`);
     return;
   }
@@ -890,7 +937,7 @@ async function markSleeping(sessionKey, reason) {
     sockets.delete(sessionKey);
     starting.delete(sessionKey);
     try {
-      if (typeof sock.end === "function") sock.end(new Error("session_sleeping"));
+      if (typeof sock.end === "function") sock.end();
     } catch (err) {
       warn("socket_end_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
     }
@@ -1121,6 +1168,22 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
 
   log("disconnected", { session_key: sessionKey, code: code || null });
 
+  if (code === 428) {
+    // 428 depois de scan/retry interno é recuperável; não entra em contador de erro nem sleeping.
+    intentionalStops.delete(sessionKey);
+    const stillActive428 = await getConnectionBySessionKey(sessionKey);
+    if (!stillActive428 || stillActive428.deleted_at || stillActive428.status === STATUS_SLEEPING) return;
+
+    await safeUpdateConn(sessionKey, {
+      status: "disconnected",
+      qr_base64: null,
+      last_seen: nowIso(),
+      status_reason: "close_428_recoverable_restart",
+    });
+    scheduleRestart(sessionKey, Math.min(CLOSE_RETRY_MS, 5000), "close_428_recoverable_restart");
+    return;
+  }
+
   if (code === 515 || isRestartRequiredReason(lastDisconnect && lastDisconnect.error)) {
     const disconnectedRow = await getConnectionBySessionKey(sessionKey);
     await recordHealthLog(disconnectedRow || { session_key: sessionKey }, "restart_required_515", "restart_required_after_login", {
@@ -1201,6 +1264,24 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   const maxAttempts = code === 408 ? QR_MAX_RESTARTS : CLOSE_MAX_RESTARTS;
 
   if (attempts >= maxAttempts) {
+    if (DISABLE_AUTO_SLEEP_ON_RECENT_ERRORS) {
+      warn("close_max_restarts_reached_no_sleep", {
+        session_key: sessionKey,
+        code: code || null,
+        attempts,
+        max_attempts: maxAttempts,
+      });
+      await safeUpdateConn(sessionKey, {
+        status: "disconnected",
+        qr_base64: null,
+        last_seen: nowIso(),
+        status_reason: `closed_${reason}_after_${attempts}_tries_no_sleep`,
+      });
+      const nextDelay = Math.min(Math.max(CLOSE_RETRY_MS, 30000), 120000);
+      scheduleRestart(sessionKey, nextDelay, `closed_${reason}_after_${attempts}_tries_no_sleep`);
+      return;
+    }
+
     await markSleeping(sessionKey, `closed_${reason}_after_${attempts}_tries`);
     return;
   }
@@ -2033,6 +2114,10 @@ async function bootstrap() {
     qr_max_restarts: QR_MAX_RESTARTS,
     close_retry_ms: CLOSE_RETRY_MS,
     close_max_restarts: CLOSE_MAX_RESTARTS,
+    connection_error_window_seconds: CONNECTION_ERROR_WINDOW_SECONDS,
+    connection_error_sleep_threshold: CONNECTION_ERROR_SLEEP_THRESHOLD,
+    disable_auto_sleep_on_recent_errors: DISABLE_AUTO_SLEEP_ON_RECENT_ERRORS,
+    ignore_baileys_sync_noise: IGNORE_BAILEYS_SYNC_NOISE,
     clean_orphan_tokens: CLEAN_ORPHAN_TOKENS,
     max_session_starts_per_refresh: MAX_SESSION_STARTS_PER_REFRESH,
     session_start_spacing_ms: SESSION_START_SPACING_MS,
