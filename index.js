@@ -82,7 +82,10 @@ const STATUS_SLEEPING = "sleeping";
 const CONNECTION_ERROR_WINDOW_SECONDS = Number(process.env.CONNECTION_ERROR_WINDOW_SECONDS || 300);
 const CONNECTION_ERROR_SLEEP_THRESHOLD = Number(process.env.CONNECTION_ERROR_SLEEP_THRESHOLD || 50);
 
-const HEALTH_ERROR_RE = /(408|500|503|timed out|timeout|messagecountererror|connection terminated|connection errored|init queries)/i;
+// Não use /408/ puro aqui: logs internos do Baileys podem conter textos como
+// "recv 408 bytes", que é só tamanho de pacote recebido, não HTTP 408.
+// 408/500/503 reais continuam sendo tratados em handleConnectionUpdate pelo statusCode numérico.
+const HEALTH_ERROR_RE = /(timed out|timeout|messagecountererror|connection terminated|connection errored|init queries|stream:error|stream errored|statusCode[\"'\s:]*?(408|500|503)|code[\"'\s:]*?(408|500|503)|\b(close|closed)_(408|500|503)\b)/i;
 // 428 geralmente aparece quando o Baileys tenta responder retry/decrypt depois que o socket já fechou.
 // Isso deve reiniciar, não jogar em sleeping.
 const UNHEALTHY_CLOSE_CODES = new Set([408, 500, 503]);
@@ -187,6 +190,10 @@ function isIgnorableBaileysNoise(value) {
   if (!IGNORE_BAILEYS_SYNC_NOISE) return false;
   const text = String(value && value.message ? value.message : value || "");
   if (!text) return false;
+
+  // Ex.: "recv 408 bytes, total recv 408 bytes" é log de volume de bytes,
+  // não erro HTTP/WhatsApp 408. Antes isso segurava a conexão em warming_up.
+  if (/\b(recv|sent)\s+\d+\s+bytes\b/i.test(text)) return true;
 
   return /(syncAction|histNotification|failed to decrypt message|status@broadcast|session_sleeping|logged_out_reset|Connection Closed|Precondition Required|sendRetryRequest)/i.test(text);
 }
