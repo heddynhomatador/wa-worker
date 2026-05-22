@@ -67,6 +67,9 @@ const CLEAN_ORPHAN_TOKENS = String(process.env.CLEAN_ORPHAN_TOKENS || "false") =
 const ORPHAN_TOKEN_SCAN_MS = Number(process.env.ORPHAN_TOKEN_SCAN_MS || 300000);
 const MAX_SESSION_STARTS_PER_REFRESH = Number(process.env.MAX_SESSION_STARTS_PER_REFRESH || 3);
 const SESSION_START_SPACING_MS = Number(process.env.SESSION_START_SPACING_MS || 1500);
+const SKIP_OLD_DISCONNECTED_SESSIONS = String(process.env.SKIP_OLD_DISCONNECTED_SESSIONS || "true") === "true";
+const OLD_DISCONNECTED_MAX_AGE_MINUTES = Number(process.env.OLD_DISCONNECTED_MAX_AGE_MINUTES || 15);
+const READY_IGNORE_RECENT_TRANSIENT_ERRORS = String(process.env.READY_IGNORE_RECENT_TRANSIENT_ERRORS || "true") === "true";
 
 const QR_RETRY_MS = Number(process.env.QR_RETRY_MS || 60000);
 const QR_MAX_RESTARTS = Number(process.env.QR_MAX_RESTARTS || 3);
@@ -92,6 +95,9 @@ const UNHEALTHY_CLOSE_CODES = new Set([408, 500, 503]);
 // No Baileys, o close/stream 515 normalmente significa "restart required" após pareamento/login.
 // Não é motivo para pausar a conexão; o correto é reiniciar o socket usando as credenciais recém-salvas.
 const RESTART_REQUIRED_RE = /(\b515\b|restart required|stream errored)/i;
+// Ruídos/transientes do Baileys que não devem manter a conexão presa como "Preparando"
+// se o socket já abriu e o ready check consegue validar o WhatsApp.
+const READY_TRANSIENT_ERROR_RE = /(Connection Terminated by Server|Connection Closed|Precondition Required|sendRetryRequest|messages-recv|WebSocket was closed|recv\s+\d+\s+bytes|sent\s+\d+\s+bytes|failed to decrypt message|syncAction|histNotification|status@broadcast)/i;
 const NIL_UUID = "00000000-0000-0000-0000-000000000000";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -153,6 +159,40 @@ function errorLog(event, fields = {}) {
   console.error(JSON.stringify({ event, time: nowIso(), ...fields }));
 }
 
+// Alguns módulos internos do Baileys/libsignal podem imprimir sessões Signal completas no console
+// (ex.: "Closing session: SessionEntry", currentRatchet, privKey). Isso polui o Render
+// e pode expor material sensível de sessão. Filtramos apenas esse ruído bruto, sem mexer
+// nos logs JSON do worker.
+const nativeConsole = {
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+};
+
+function shouldDropRawBaileysConsoleNoise(args) {
+  const text = args
+    .map((arg) => {
+      if (typeof arg === "string") return arg;
+      try { return JSON.stringify(arg); } catch { return String(arg); }
+    })
+    .join(" ");
+
+  return /(Closing session:\s*SessionEntry|SessionEntry\s*\{|currentRatchet|ephemeralKeyPair|privKey\s*:|remoteIdentityKey|pendingPreKey)/i.test(text);
+}
+
+console.log = (...args) => {
+  if (shouldDropRawBaileysConsoleNoise(args)) return;
+  nativeConsole.log(...args);
+};
+console.warn = (...args) => {
+  if (shouldDropRawBaileysConsoleNoise(args)) return;
+  nativeConsole.warn(...args);
+};
+console.error = (...args) => {
+  if (shouldDropRawBaileysConsoleNoise(args)) return;
+  nativeConsole.error(...args);
+};
+
 function safeDetails(details) {
   if (!details || typeof details !== "object") return {};
   return details;
@@ -186,6 +226,24 @@ function isRestartRequiredReason(value) {
   return RESTART_REQUIRED_RE.test(String(value && value.message ? value.message : value || ""));
 }
 
+function isReadyTransientReason(value) {
+  const text = String(value && value.message ? value.message : value || "");
+  return READY_TRANSIENT_ERROR_RE.test(text);
+}
+
+function clearUnhealthyIfOnlyTransient(sessionKey) {
+  const reason = unhealthyReason.get(sessionKey) || "";
+  if (!READY_IGNORE_RECENT_TRANSIENT_ERRORS || !isReadyTransientReason(reason)) return false;
+  unhealthyUntil.delete(sessionKey);
+  unhealthyReason.delete(sessionKey);
+  connectionErrorHistory.delete(sessionKey);
+  log("ready_transient_error_ignored", {
+    session_key: sessionKey,
+    reason: String(reason).slice(0, 180),
+  });
+  return true;
+}
+
 function isIgnorableBaileysNoise(value) {
   if (!IGNORE_BAILEYS_SYNC_NOISE) return false;
   const text = String(value && value.message ? value.message : value || "");
@@ -203,6 +261,9 @@ function isConnectionHealthReason(value) {
   if (!text) return false;
   if (isRestartRequiredReason(text)) return false;
   if (isIgnorableBaileysNoise(text)) return false;
+  // "Connection Terminated by Server" pode aparecer durante a troca/reinício interno do Baileys.
+  // O connection.update com statusCode real continua sendo a fonte de verdade para derrubar/reiniciar.
+  if (READY_IGNORE_RECENT_TRANSIENT_ERRORS && isReadyTransientReason(text)) return false;
   return HEALTH_ERROR_RE.test(text);
 }
 
@@ -843,12 +904,14 @@ async function runReadyCheck(conn, sock, reason) {
 
   const unhealthyMs = unhealthyRemainingMs(conn.session_key);
   if (unhealthyMs > 0) {
-    return {
-      ok: false,
-      reason: "recent_session_error",
-      retry_after_ms: unhealthyMs,
-      detail: unhealthyReason.get(conn.session_key) || null,
-    };
+    if (!clearUnhealthyIfOnlyTransient(conn.session_key)) {
+      return {
+        ok: false,
+        reason: "recent_session_error",
+        retry_after_ms: unhealthyMs,
+        detail: unhealthyReason.get(conn.session_key) || null,
+      };
+    }
   }
 
   if (READY_CHECK_ON_WHATSAPP) {
@@ -1390,6 +1453,33 @@ async function updateOutboxAck(messageId, patch, eventName) {
   }
 }
 
+function shouldStartConnection(connection) {
+  if (!connection || !connection.session_key || connection.deleted_at) return false;
+  if (!SKIP_OLD_DISCONNECTED_SESSIONS) return true;
+  if (sockets.has(connection.session_key) || starting.has(connection.session_key)) return true;
+
+  const status = String(connection.status || "");
+  const mayBeManualQrFlow = new Set(["logged_out", "qr_ready", "connecting", "disconnected", "error"]);
+  if (!mayBeManualQrFlow.has(status)) return true;
+
+  const lastSeenMs = connection.last_seen ? Date.parse(connection.last_seen) : 0;
+  const ageMs = lastSeenMs ? Date.now() - lastSeenMs : Number.POSITIVE_INFINITY;
+  const maxAgeMs = OLD_DISCONNECTED_MAX_AGE_MINUTES * 60 * 1000;
+
+  if (ageMs > maxAgeMs) {
+    clearRestartTimer(connection.session_key);
+    log("session_start_skipped_old_disconnected", {
+      session_key: connection.session_key,
+      status,
+      last_seen: connection.last_seen || null,
+      max_age_minutes: OLD_DISCONNECTED_MAX_AGE_MINUTES,
+    });
+    return false;
+  }
+
+  return true;
+}
+
 async function refreshSessions() {
   if (!(await ensureWorkerLock())) return;
   if (refreshingSessions) return;
@@ -1418,6 +1508,10 @@ async function refreshSessions() {
 
       if (connection.status === STATUS_SLEEPING) {
         clearRestartTimer(connection.session_key);
+        continue;
+      }
+
+      if (!shouldStartConnection(connection)) {
         continue;
       }
 
@@ -1723,12 +1817,14 @@ function checkConnectionHealth(conn) {
 
   const remaining = unhealthyRemainingMs(conn.session_key);
   if (remaining > 0) {
-    return {
-      ok: false,
-      reason: "recent_session_error",
-      remaining_ms: remaining,
-      detail: unhealthyReason.get(conn.session_key) || null,
-    };
+    if (!clearUnhealthyIfOnlyTransient(conn.session_key)) {
+      return {
+        ok: false,
+        reason: "recent_session_error",
+        remaining_ms: remaining,
+        detail: unhealthyReason.get(conn.session_key) || null,
+      };
+    }
   }
 
   return { ok: true, sock };
@@ -2128,6 +2224,9 @@ async function bootstrap() {
     clean_orphan_tokens: CLEAN_ORPHAN_TOKENS,
     max_session_starts_per_refresh: MAX_SESSION_STARTS_PER_REFRESH,
     session_start_spacing_ms: SESSION_START_SPACING_MS,
+    skip_old_disconnected_sessions: SKIP_OLD_DISCONNECTED_SESSIONS,
+    old_disconnected_max_age_minutes: OLD_DISCONNECTED_MAX_AGE_MINUTES,
+    ready_ignore_recent_transient_errors: READY_IGNORE_RECENT_TRANSIENT_ERRORS,
   });
 
   await refreshSessions();
