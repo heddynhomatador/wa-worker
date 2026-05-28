@@ -70,6 +70,14 @@ const SESSION_START_SPACING_MS = Number(process.env.SESSION_START_SPACING_MS || 
 const SKIP_OLD_DISCONNECTED_SESSIONS = String(process.env.SKIP_OLD_DISCONNECTED_SESSIONS || "true") === "true";
 const OLD_DISCONNECTED_MAX_AGE_MINUTES = Number(process.env.OLD_DISCONNECTED_MAX_AGE_MINUTES || 15);
 const READY_IGNORE_RECENT_TRANSIENT_ERRORS = String(process.env.READY_IGNORE_RECENT_TRANSIENT_ERRORS || "true") === "true";
+// Se uma conexão acabou de ser criada e ainda está "disconnected" sem last_seen,
+// ela deve poder gerar o primeiro QR. Antes ela era tratada como sessão velha,
+// porque last_seen null virava idade infinita.
+const ALLOW_NEW_DISCONNECTED_WITHOUT_LAST_SEEN = String(process.env.ALLOW_NEW_DISCONNECTED_WITHOUT_LAST_SEEN || "true") === "true";
+const NEW_DISCONNECTED_START_WINDOW_MINUTES = Number(process.env.NEW_DISCONNECTED_START_WINDOW_MINUTES || 30);
+// Evita loop infinito de QR quando o número está desconectado/restrito ou quando ninguém escaneia.
+// Para conexões já prontas/ativas, 408 continua sendo tratado como queda recuperável.
+const QR_FAILURE_SLEEP_AFTER_MAX = String(process.env.QR_FAILURE_SLEEP_AFTER_MAX || "true") === "true";
 
 const QR_RETRY_MS = Number(process.env.QR_RETRY_MS || 60000);
 const QR_MAX_RESTARTS = Number(process.env.QR_MAX_RESTARTS || 3);
@@ -588,7 +596,7 @@ function unhealthyRemainingMs(sessionKey) {
 async function getConnectionBySessionKey(sessionKey) {
   const { data, error } = await supabase
     .from("wa_connections")
-    .select("id, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
+    .select("id, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at, created_at")
     .eq("session_key", sessionKey)
     .maybeSingle();
 
@@ -733,7 +741,7 @@ async function ensureWorkerLock() {
 async function refreshConnectionsCache() {
   const { data, error } = await supabase
     .from("wa_connections")
-    .select("id, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at")
+    .select("id, tenant_id, label, session_key, status, qr_base64, last_seen, phone_number, wa_jid, push_name, last_connected_at, status_reason, deleted_at, created_at")
     .is("deleted_at", null)
     .order("created_at", { ascending: true });
 
@@ -1334,6 +1342,18 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   const maxAttempts = code === 408 ? QR_MAX_RESTARTS : CLOSE_MAX_RESTARTS;
 
   if (attempts >= maxAttempts) {
+    if (code === 408 && QR_FAILURE_SLEEP_AFTER_MAX && isQrHandshakeFlow(stillActive)) {
+      resetCounters(sessionKey);
+      await recordHealthLog(stillActive, "qr_flow_stopped", "qr_408_limit_reached", {
+        attempts,
+        max_attempts: maxAttempts,
+        previous_status: stillActive.status || null,
+        previous_reason: stillActive.status_reason || null,
+      });
+      await markSleeping(sessionKey, `qr_not_scanned_or_restricted_after_${attempts}_408_closes`);
+      return;
+    }
+
     if (DISABLE_AUTO_SLEEP_ON_RECENT_ERRORS) {
       warn("close_max_restarts_reached_no_sleep", {
         session_key: sessionKey,
@@ -1453,6 +1473,20 @@ async function updateOutboxAck(messageId, patch, eventName) {
   }
 }
 
+function isFreshCreatedConnection(connection, windowMinutes) {
+  const createdMs = connection && connection.created_at ? Date.parse(connection.created_at) : 0;
+  if (!createdMs || !Number.isFinite(createdMs)) return false;
+  return Date.now() - createdMs <= Math.max(1, windowMinutes) * 60 * 1000;
+}
+
+function isQrHandshakeFlow(connection) {
+  if (!connection) return false;
+  const status = String(connection.status || "");
+  if (["logged_out", "qr_ready", "connecting", "error"].includes(status)) return true;
+  if (status === "disconnected" && !connection.phone_number && !connection.last_connected_at) return true;
+  return false;
+}
+
 function shouldStartConnection(connection) {
   if (!connection || !connection.session_key || connection.deleted_at) return false;
   if (!SKIP_OLD_DISCONNECTED_SESSIONS) return true;
@@ -1465,6 +1499,21 @@ function shouldStartConnection(connection) {
   const lastSeenMs = connection.last_seen ? Date.parse(connection.last_seen) : 0;
   const ageMs = lastSeenMs ? Date.now() - lastSeenMs : Number.POSITIVE_INFINITY;
   const maxAgeMs = OLD_DISCONNECTED_MAX_AGE_MINUTES * 60 * 1000;
+
+  if (
+    !lastSeenMs &&
+    status === "disconnected" &&
+    ALLOW_NEW_DISCONNECTED_WITHOUT_LAST_SEEN &&
+    isFreshCreatedConnection(connection, NEW_DISCONNECTED_START_WINDOW_MINUTES)
+  ) {
+    log("session_start_allowed_new_disconnected_without_last_seen", {
+      session_key: connection.session_key,
+      status,
+      created_at: connection.created_at || null,
+      start_window_minutes: NEW_DISCONNECTED_START_WINDOW_MINUTES,
+    });
+    return true;
+  }
 
   if (ageMs > maxAgeMs) {
     clearRestartTimer(connection.session_key);
@@ -2227,6 +2276,9 @@ async function bootstrap() {
     skip_old_disconnected_sessions: SKIP_OLD_DISCONNECTED_SESSIONS,
     old_disconnected_max_age_minutes: OLD_DISCONNECTED_MAX_AGE_MINUTES,
     ready_ignore_recent_transient_errors: READY_IGNORE_RECENT_TRANSIENT_ERRORS,
+    allow_new_disconnected_without_last_seen: ALLOW_NEW_DISCONNECTED_WITHOUT_LAST_SEEN,
+    new_disconnected_start_window_minutes: NEW_DISCONNECTED_START_WINDOW_MINUTES,
+    qr_failure_sleep_after_max: QR_FAILURE_SLEEP_AFTER_MAX,
   });
 
   await refreshSessions();
