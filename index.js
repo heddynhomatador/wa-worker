@@ -69,6 +69,8 @@ const MAX_SESSION_STARTS_PER_REFRESH = Number(process.env.MAX_SESSION_STARTS_PER
 const SESSION_START_SPACING_MS = Number(process.env.SESSION_START_SPACING_MS || 1500);
 const SKIP_OLD_DISCONNECTED_SESSIONS = String(process.env.SKIP_OLD_DISCONNECTED_SESSIONS || "true") === "true";
 const OLD_DISCONNECTED_MAX_AGE_MINUTES = Number(process.env.OLD_DISCONNECTED_MAX_AGE_MINUTES || 15);
+const FORCE_REFRESH_STALE_QR = String(process.env.FORCE_REFRESH_STALE_QR || "true") === "true";
+const QR_STALE_REFRESH_MINUTES = Number(process.env.QR_STALE_REFRESH_MINUTES || 2);
 const READY_IGNORE_RECENT_TRANSIENT_ERRORS = String(process.env.READY_IGNORE_RECENT_TRANSIENT_ERRORS || "true") === "true";
 // Se uma conexão acabou de ser criada e ainda está "disconnected" sem last_seen,
 // ela deve poder gerar o primeiro QR. Antes ela era tratada como sessão velha,
@@ -83,6 +85,8 @@ const QR_RETRY_MS = Number(process.env.QR_RETRY_MS || 60000);
 const QR_MAX_RESTARTS = Number(process.env.QR_MAX_RESTARTS || 3);
 const CLOSE_RETRY_MS = Number(process.env.CLOSE_RETRY_MS || 15000);
 const CLOSE_MAX_RESTARTS = Number(process.env.CLOSE_MAX_RESTARTS || 5);
+const CONFLICT_REPLACED_BACKOFF_MS = Number(process.env.CONFLICT_REPLACED_BACKOFF_MS || 120000);
+const CONFLICT_REPLACED_MAX_RESTARTS = Number(process.env.CONFLICT_REPLACED_MAX_RESTARTS || 2);
 // Enquanto estamos estabilizando sessões Baileys, não pausamos automaticamente por rajadas de erro.
 // Pausar por threshold estava prendendo sessões boas logo após o QR, por causa de sync/history/retry interno.
 const DISABLE_AUTO_SLEEP_ON_RECENT_ERRORS = String(process.env.DISABLE_AUTO_SLEEP_ON_RECENT_ERRORS || "true") === "true";
@@ -103,6 +107,7 @@ const UNHEALTHY_CLOSE_CODES = new Set([408, 500, 503]);
 // No Baileys, o close/stream 515 normalmente significa "restart required" após pareamento/login.
 // Não é motivo para pausar a conexão; o correto é reiniciar o socket usando as credenciais recém-salvas.
 const RESTART_REQUIRED_RE = /(\b515\b|restart required|stream errored)/i;
+const CONFLICT_REPLACED_RE = /(conflict[^\n\r]{0,160}replaced|replaced[^\n\r]{0,160}conflict|type["'\s:]+replaced|stream:error[^\n\r]{0,160}conflict)/i;
 // Ruídos/transientes do Baileys que não devem manter a conexão presa como "Preparando"
 // se o socket já abriu e o ready check consegue validar o WhatsApp.
 const READY_TRANSIENT_ERROR_RE = /(Connection Terminated by Server|Connection Closed|Precondition Required|sendRetryRequest|messages-recv|WebSocket was closed|recv\s+\d+\s+bytes|sent\s+\d+\s+bytes|failed to decrypt message|syncAction|histNotification|status@broadcast)/i;
@@ -234,8 +239,19 @@ function isRestartRequiredReason(value) {
   return RESTART_REQUIRED_RE.test(String(value && value.message ? value.message : value || ""));
 }
 
+function errorText(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (value && value.message) return String(value.message);
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+function isConflictReplacedReason(value) {
+  return CONFLICT_REPLACED_RE.test(errorText(value));
+}
+
 function isReadyTransientReason(value) {
-  const text = String(value && value.message ? value.message : value || "");
+  const text = errorText(value);
   return READY_TRANSIENT_ERROR_RE.test(text);
 }
 
@@ -1123,11 +1139,13 @@ async function startSession(sessionKey) {
     ensureDir(path.dirname(authPath));
     ensureDir(authPath);
 
-    await safeUpdateConn(sessionKey, {
+    const connectingPatch = {
       status: "connecting",
       last_seen: nowIso(),
       status_reason: null,
-    });
+    };
+    if (isQrHandshakeFlow(row)) connectingPatch.qr_base64 = null;
+    await safeUpdateConn(sessionKey, connectingPatch);
 
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     const socketConfig = {
@@ -1245,6 +1263,37 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
   clearReadyTimer(sessionKey);
 
   log("disconnected", { session_key: sessionKey, code: code || null });
+
+  if (code === 440 || isConflictReplacedReason(lastDisconnect && lastDisconnect.error)) {
+    intentionalStops.delete(sessionKey);
+    const conflictRow = await getConnectionBySessionKey(sessionKey);
+    if (!conflictRow || conflictRow.deleted_at || conflictRow.status === STATUS_SLEEPING) return;
+
+    const attempts = incCounter(closeRestartCounts, sessionKey);
+    const delay = Math.min(
+      Math.max(CONFLICT_REPLACED_BACKOFF_MS, 30000) * Math.max(1, Math.min(attempts, CONFLICT_REPLACED_MAX_RESTARTS)),
+      10 * 60 * 1000,
+    );
+
+    await safeUpdateConn(sessionKey, {
+      status: "disconnected",
+      qr_base64: null,
+      last_seen: nowIso(),
+      status_reason: `conflict_replaced_backoff_${Math.round(delay / 1000)}s`,
+    });
+    await recordHealthLog(conflictRow, "conflict_replaced", "another_socket_replaced_this_session", {
+      code: code || null,
+      attempts,
+      delay_ms: delay,
+    });
+    warn("session_conflict_replaced_backoff", {
+      session_key: sessionKey,
+      attempts,
+      delay_ms: delay,
+    });
+    scheduleRestart(sessionKey, delay, "conflict_replaced_backoff");
+    return;
+  }
 
   if (code === 428) {
     // 428 depois de scan/retry interno é recuperável; não entra em contador de erro nem sleeping.
@@ -1487,6 +1536,27 @@ function isQrHandshakeFlow(connection) {
   return false;
 }
 
+function connectionStartPriority(connection) {
+  if (!connection || !connection.session_key) return 999;
+  if (sockets.has(connection.session_key) || starting.has(connection.session_key)) return 0;
+
+  const status = String(connection.status || "");
+  const fresh = isFreshCreatedConnection(connection, NEW_DISCONNECTED_START_WINDOW_MINUTES);
+  const hasIdentity = Boolean(connection.phone_number || connection.wa_jid || connection.last_connected_at);
+
+  if (!hasIdentity && fresh) return 1;
+  if (!hasIdentity && status === "logged_out") return 2;
+  if (!hasIdentity && status === "qr_ready") return 3;
+  if (!hasIdentity && status === "connecting") return 4;
+  if (!hasIdentity && status === "error") return 5;
+  if (!hasIdentity && status === "disconnected") return 6;
+  if (status === STATUS_WARMING_UP) return 20;
+  if (status === STATUS_CONNECTED) return 30;
+  if (status === "disconnected") return 40;
+  if (status === "logged_out" || status === "qr_ready" || status === "connecting" || status === "error") return 45;
+  return 50;
+}
+
 function shouldStartConnection(connection) {
   if (!connection || !connection.session_key || connection.deleted_at) return false;
   if (!SKIP_OLD_DISCONNECTED_SESSIONS) return true;
@@ -1499,6 +1569,22 @@ function shouldStartConnection(connection) {
   const lastSeenMs = connection.last_seen ? Date.parse(connection.last_seen) : 0;
   const ageMs = lastSeenMs ? Date.now() - lastSeenMs : Number.POSITIVE_INFINITY;
   const maxAgeMs = OLD_DISCONNECTED_MAX_AGE_MINUTES * 60 * 1000;
+
+  if (
+    FORCE_REFRESH_STALE_QR &&
+    status === "qr_ready" &&
+    !connection.phone_number &&
+    ageMs > Math.max(1, QR_STALE_REFRESH_MINUTES) * 60 * 1000
+  ) {
+    clearRestartTimer(connection.session_key);
+    log("session_start_allowed_stale_qr_refresh", {
+      session_key: connection.session_key,
+      status,
+      last_seen: connection.last_seen || null,
+      qr_stale_refresh_minutes: QR_STALE_REFRESH_MINUTES,
+    });
+    return true;
+  }
 
   if (
     !lastSeenMs &&
@@ -1552,7 +1638,13 @@ async function refreshSessions() {
 
     let startsThisRefresh = 0;
 
-    for (const connection of connections) {
+    const orderedConnections = [...connections].sort((a, b) => {
+      const priority = connectionStartPriority(a) - connectionStartPriority(b);
+      if (priority !== 0) return priority;
+      return Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0);
+    });
+
+    for (const connection of orderedConnections) {
       if (!connection || !connection.session_key) continue;
 
       if (connection.status === STATUS_SLEEPING) {
@@ -2275,10 +2367,14 @@ async function bootstrap() {
     session_start_spacing_ms: SESSION_START_SPACING_MS,
     skip_old_disconnected_sessions: SKIP_OLD_DISCONNECTED_SESSIONS,
     old_disconnected_max_age_minutes: OLD_DISCONNECTED_MAX_AGE_MINUTES,
+    force_refresh_stale_qr: FORCE_REFRESH_STALE_QR,
+    qr_stale_refresh_minutes: QR_STALE_REFRESH_MINUTES,
     ready_ignore_recent_transient_errors: READY_IGNORE_RECENT_TRANSIENT_ERRORS,
     allow_new_disconnected_without_last_seen: ALLOW_NEW_DISCONNECTED_WITHOUT_LAST_SEEN,
     new_disconnected_start_window_minutes: NEW_DISCONNECTED_START_WINDOW_MINUTES,
     qr_failure_sleep_after_max: QR_FAILURE_SLEEP_AFTER_MAX,
+    conflict_replaced_backoff_ms: CONFLICT_REPLACED_BACKOFF_MS,
+    conflict_replaced_max_restarts: CONFLICT_REPLACED_MAX_RESTARTS,
   });
 
   await refreshSessions();
