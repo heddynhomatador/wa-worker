@@ -280,6 +280,7 @@ let processingOutbox = false;
 let syncingSessionHealth = false;
 let workerLockAcquired = false;
 let workerLockRpcAvailable = true;
+let workerLockLastError = null;
 let lastOrphanTokenScanAt = 0;
 let shuttingDown = false;
 let claimRpcAvailable = true;
@@ -638,7 +639,20 @@ function ackName(status) {
 
 function isMissingRpc(error, name) {
   const msg = String(error && error.message ? error.message : "");
-  return error && (error.code === "PGRST202" || msg.includes(name));
+  return Boolean(error && (
+    error.code === "PGRST202" ||
+    new RegExp(`could not find (?:the )?function.*${name}`, "i").test(msg) ||
+    new RegExp(`function.*${name}.*does not exist`, "i").test(msg) ||
+    (/schema cache/i.test(msg) && msg.includes(name))
+  ));
+}
+
+function isPermissionDeniedRpc(error, name) {
+  const msg = String(error && error.message ? error.message : "");
+  return Boolean(error && (
+    error.code === "42501" ||
+    (/permission denied for function/i.test(msg) && msg.includes(name))
+  ));
 }
 
 function clearRestartTimer(sessionKey) {
@@ -860,7 +874,15 @@ async function ensureWorkerLock() {
   });
 
   if (error) {
-    if (isMissingRpc(error, "try_acquire_wa_worker_lease_v2")) {
+    const missingRpc = isMissingRpc(error, "try_acquire_wa_worker_lease_v2");
+    const permissionDenied = isPermissionDeniedRpc(error, "try_acquire_wa_worker_lease_v2");
+    workerLockLastError = {
+      type: missingRpc ? "missing" : permissionDenied ? "permission_denied" : "rpc_error",
+      code: error.code || null,
+      message: error.message || "worker_lock_rpc_error",
+    };
+
+    if (missingRpc) {
       workerLockRpcAvailable = false;
       if (!WORKER_LOCK_REQUIRED) {
         workerLockAcquired = true;
@@ -891,6 +913,7 @@ async function ensureWorkerLock() {
     return false;
   }
 
+  workerLockLastError = null;
   const acquired = data === true;
 
   if (!acquired && !WORKER_LOCK_REQUIRED && IGNORE_WORKER_LOCK_WHEN_OPTIONAL) {
@@ -2671,6 +2694,14 @@ async function bootstrap() {
     throw new Error("worker_lock_migration_missing: aplique a migration 202608060002_wa_worker_single_owner_lease.sql");
   }
 
+  if (!initialLock && WORKER_LOCK_REQUIRED && workerLockLastError) {
+    const failureCode = workerLockLastError.type === "permission_denied"
+      ? "worker_lock_permission_denied"
+      : "worker_lock_rpc_error";
+    await markWorkerBootstrapFailure(failureCode);
+    throw new Error(`${failureCode}: confirme a SUPABASE_SERVICE_ROLE_KEY e as permissoes da funcao try_acquire_wa_worker_lease_v2`);
+  }
+
   if (!initialLock) {
     warn("worker_waiting_for_active_lease", {
       instance_id: WORKER_INSTANCE_ID,
@@ -2785,4 +2816,6 @@ export {
   computeReconnectDelay,
   sanitizeLogFields,
   shouldStartConnection,
+  isMissingRpc,
+  isPermissionDeniedRpc,
 };
