@@ -1257,7 +1257,7 @@ function scheduleRestart(sessionKey, delayMs, reason) {
       return;
     }
 
-    await startSession(sessionKey);
+    await startSession(sessionKey, scheduledGeneration);
   }, delayMs);
 
   restartTimers.set(sessionKey, timer);
@@ -1306,7 +1306,10 @@ async function stopSession(
   log("disconnected", { session_key: sessionKey, reason });
 }
 
-async function startSession(sessionKey) {
+async function startSession(
+  sessionKey,
+  scheduledGeneration = sessionRuntime.currentGeneration(sessionKey),
+) {
   if (!sessionKey) return;
   if (sockets.has(sessionKey) || starting.has(sessionKey)) return;
 
@@ -2626,7 +2629,7 @@ async function bootstrap() {
   }
 
   log("worker_started", {
-    worker_build: "v7-flat-20260807",
+    worker_build: "v7.3-session-start-20260807",
     tokens_base_dir: TOKENS_BASE_DIR,
     tokens_folder: TOKENS_FOLDER,
     worker_instance_id: WORKER_INSTANCE_ID,
