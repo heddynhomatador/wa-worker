@@ -1,23 +1,24 @@
-"use strict";
-
-const { createClient } = require("@supabase/supabase-js");
-const qrcode = require("qrcode");
-const {
-  default: makeWASocket,
+import { createClient } from "@supabase/supabase-js";
+import NodeCache from "@cacheable/node-cache";
+import qrcode from "qrcode";
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   jidNormalizedUser,
   Browsers,
-} = require("@whiskeysockets/baileys");
-const fs = require("fs");
-const path = require("path");
-const os = require("os");
-const crypto = require("crypto");
-const WebSocket = require("ws");
+  makeCacheableSignalKeyStore,
+} from "@whiskeysockets/baileys";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
+import { SessionRuntimeRegistry, computeReconnectDelay } from "./lib/session-runtime.js";
+import { sanitizeLogFields } from "./lib/sanitize.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SHOULD_BOOTSTRAP = String(process.env.WA_WORKER_SKIP_BOOTSTRAP || "false") !== "true";
 
 const TOKENS_BASE_DIR = process.env.TOKENS_BASE_DIR || "/var/data";
 const TOKENS_FOLDER = process.env.TOKENS_FOLDER || "baileys-auth";
@@ -42,13 +43,14 @@ const ON_WHATSAPP_TIMEOUT_MS = Number(process.env.ON_WHATSAPP_TIMEOUT_MS || 1500
 const SEND_MESSAGE_TIMEOUT_MS = Number(process.env.SEND_MESSAGE_TIMEOUT_MS || 60000);
 const SESSION_HEALTH_SYNC_MS = Number(process.env.SESSION_HEALTH_SYNC_MS || 1800000);
 const SESSION_READY_AFTER_SECONDS = Number(process.env.SESSION_READY_AFTER_SECONDS || 60);
-const READY_CHECK_ON_WHATSAPP = String(process.env.READY_CHECK_ON_WHATSAPP || "true") === "true";
+const READY_CHECK_ON_WHATSAPP = String(process.env.READY_CHECK_ON_WHATSAPP || "false") === "true";
 const READY_CHECK_TIMEOUT_MS = Number(process.env.READY_CHECK_TIMEOUT_MS || 15000);
-const BAILEYS_FIRE_INIT_QUERIES = String(process.env.BAILEYS_FIRE_INIT_QUERIES || "false") === "true";
+const BAILEYS_FIRE_INIT_QUERIES = String(process.env.BAILEYS_FIRE_INIT_QUERIES || "true") === "true";
 // IMPORTANTE: a env antiga BAILEYS_FETCH_LATEST_VERSION=false causou erro 405 em algumas conexões.
 // Agora o worker busca a versão atual por padrão. Para desligar, use BAILEYS_DISABLE_FETCH_LATEST_VERSION=true.
 const BAILEYS_DISABLE_FETCH_LATEST_VERSION = String(process.env.BAILEYS_DISABLE_FETCH_LATEST_VERSION || "false") === "true";
 const BAILEYS_FETCH_LATEST_VERSION = !BAILEYS_DISABLE_FETCH_LATEST_VERSION;
+const BAILEYS_VERSION_CACHE_MS = Number(process.env.BAILEYS_VERSION_CACHE_MS || 21600000);
 const BAILEYS_CONNECT_TIMEOUT_MS = Number(process.env.BAILEYS_CONNECT_TIMEOUT_MS || 60000);
 const BAILEYS_KEEP_ALIVE_INTERVAL_MS = Number(process.env.BAILEYS_KEEP_ALIVE_INTERVAL_MS || 25000);
 const BAILEYS_DEFAULT_QUERY_TIMEOUT_MS = Number(process.env.BAILEYS_DEFAULT_QUERY_TIMEOUT_MS || 60000);
@@ -60,8 +62,8 @@ const BAILEYS_EMIT_OWN_EVENTS = String(process.env.BAILEYS_EMIT_OWN_EVENTS || "t
 const WORKER_INSTANCE_ID = process.env.WORKER_INSTANCE_ID ||
   `${os.hostname()}-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
 const WORKER_LOCK_TTL_SECONDS = Number(process.env.WORKER_LOCK_TTL_SECONDS || 60);
-const WORKER_LOCK_REQUIRED = String(process.env.WORKER_LOCK_REQUIRED || "false") === "true";
-const IGNORE_WORKER_LOCK_WHEN_OPTIONAL = String(process.env.IGNORE_WORKER_LOCK_WHEN_OPTIONAL || "true") === "true";
+const WORKER_LOCK_REQUIRED = String(process.env.WORKER_LOCK_REQUIRED || "true") === "true";
+const IGNORE_WORKER_LOCK_WHEN_OPTIONAL = String(process.env.IGNORE_WORKER_LOCK_WHEN_OPTIONAL || "false") === "true";
 const SESSION_SEND_CONCURRENCY = Number(process.env.SESSION_SEND_CONCURRENCY || 1);
 const CLEAN_ORPHAN_TOKENS = String(process.env.CLEAN_ORPHAN_TOKENS || "false") === "true";
 const ORPHAN_TOKEN_SCAN_MS = Number(process.env.ORPHAN_TOKEN_SCAN_MS || 300000);
@@ -124,12 +126,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     autoRefreshToken: false,
     detectSessionInUrl: false,
   },
-  realtime: {
-    transport: WebSocket,
-  },
 });
 
-const sockets = new Map();
+const sessionRuntime = new SessionRuntimeRegistry();
+const sockets = sessionRuntime.sockets;
 const starting = new Set();
 const intentionalStops = new Set();
 const restartTimers = new Map();
@@ -155,21 +155,25 @@ let shuttingDown = false;
 let claimRpcAvailable = true;
 let resetStaleRpcAvailable = true;
 let markUnconfirmedRpcAvailable = true;
+let cachedBaileysVersion = null;
+let cachedBaileysVersionAt = 0;
+let baileysVersionFetchPromise = null;
+let fatalExitScheduled = false;
 
 function nowIso() {
   return new Date().toISOString();
 }
 
 function log(event, fields = {}) {
-  console.log(JSON.stringify({ event, time: nowIso(), ...fields }));
+  console.log(JSON.stringify(sanitizeLogFields({ event, time: nowIso(), ...fields })));
 }
 
 function warn(event, fields = {}) {
-  console.warn(JSON.stringify({ event, time: nowIso(), ...fields }));
+  console.warn(JSON.stringify(sanitizeLogFields({ event, time: nowIso(), ...fields })));
 }
 
 function errorLog(event, fields = {}) {
-  console.error(JSON.stringify({ event, time: nowIso(), ...fields }));
+  console.error(JSON.stringify(sanitizeLogFields({ event, time: nowIso(), ...fields })));
 }
 
 // Alguns módulos internos do Baileys/libsignal podem imprimir sessões Signal completas no console
@@ -208,7 +212,7 @@ console.error = (...args) => {
 
 function safeDetails(details) {
   if (!details || typeof details !== "object") return {};
-  return details;
+  return sanitizeLogFields(details);
 }
 
 function sleep(ms) {
@@ -228,6 +232,46 @@ function withTimeout(promise, timeoutMs, label) {
   return Promise.race([promise, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
   });
+}
+
+async function getCachedBaileysVersion() {
+  if (!BAILEYS_FETCH_LATEST_VERSION) return null;
+
+  const age = Date.now() - cachedBaileysVersionAt;
+  if (cachedBaileysVersion && age >= 0 && age < BAILEYS_VERSION_CACHE_MS) {
+    return cachedBaileysVersion;
+  }
+
+  if (baileysVersionFetchPromise) return baileysVersionFetchPromise;
+
+  baileysVersionFetchPromise = (async () => {
+    try {
+      const result = await withTimeout(
+        fetchLatestBaileysVersion(),
+        Math.min(BAILEYS_CONNECT_TIMEOUT_MS, 15000),
+        "fetch_baileys_version",
+      );
+      if (result && Array.isArray(result.version)) {
+        cachedBaileysVersion = result.version;
+        cachedBaileysVersionAt = Date.now();
+        log("baileys_version_cache_refreshed", {
+          version: result.version,
+          is_latest: result.isLatest === true,
+        });
+        return cachedBaileysVersion;
+      }
+    } catch (err) {
+      warn("baileys_version_fetch_failed_using_library_default", {
+        error: String(err && err.message ? err.message : err),
+      });
+    }
+
+    return cachedBaileysVersion;
+  })().finally(() => {
+    baileysVersionFetchPromise = null;
+  });
+
+  return baileysVersionFetchPromise;
 }
 
 function isTemporaryRealtimeError(err) {
@@ -323,23 +367,11 @@ function createBaileysLogger(sessionKey) {
       warn("baileys_internal_warn", payload);
     }
 
+    // Logs internos servem apenas para diagnóstico. O estado e a reconexão são
+    // decididos exclusivamente por connection.update; isso evita falsos
+    // "instável" e reinícios concorrentes causados por mensagens internas.
     if (isRestartRequiredReason(text)) {
-      log("baileys_restart_required", { session_key: sessionKey, level });
-      return;
-    }
-
-    if (isConnectionHealthReason(text)) {
-      setTimeout(() => {
-        registerConnectionError(sessionKey, text.slice(0, 500), {
-          source: "baileys_logger",
-          level,
-        }).catch((err) => {
-          errorLog("baileys_logger_register_error_failed", {
-            session_key: sessionKey,
-            error: String(err && err.message ? err.message : err),
-          });
-        });
-      }, 0);
+      log("baileys_restart_required_observed", { session_key: sessionKey, level });
     }
   };
 
@@ -678,7 +710,7 @@ async function ensureWorkerLock() {
       workerLockAcquired = false;
       log("worker_lock_not_acquired", {
         instance_id: WORKER_INSTANCE_ID,
-        reason: "try_acquire_wa_worker_lock_rpc_missing",
+        reason: "try_acquire_wa_worker_lease_v2_rpc_missing",
         worker_lock_required: WORKER_LOCK_REQUIRED,
       });
       return false;
@@ -692,13 +724,13 @@ async function ensureWorkerLock() {
     return true;
   }
 
-  const { data, error } = await supabase.rpc("try_acquire_wa_worker_lock", {
+  const { data, error } = await supabase.rpc("try_acquire_wa_worker_lease_v2", {
     p_instance_id: WORKER_INSTANCE_ID,
     p_ttl_seconds: WORKER_LOCK_TTL_SECONDS,
   });
 
   if (error) {
-    if (isMissingRpc(error, "try_acquire_wa_worker_lock")) {
+    if (isMissingRpc(error, "try_acquire_wa_worker_lease_v2")) {
       workerLockRpcAvailable = false;
       if (!WORKER_LOCK_REQUIRED) {
         workerLockAcquired = true;
@@ -821,26 +853,29 @@ async function updateConnectedIdentity(sessionKey, sock) {
   const timestamp = Date.now();
 
   connectedAt.set(sessionKey, timestamp);
-  readyAt.delete(sessionKey);
+  readyAt.set(sessionKey, timestamp);
   clearReadyTimer(sessionKey);
+  unhealthyUntil.delete(sessionKey);
+  unhealthyReason.delete(sessionKey);
+  connectionErrorHistory.delete(sessionKey);
 
   await safeUpdateConn(sessionKey, {
-    status: STATUS_WARMING_UP,
+    status: STATUS_CONNECTED,
     qr_base64: null,
     last_seen: nowIso(),
     last_connected_at: new Date(timestamp).toISOString(),
     phone_number: phone || null,
     wa_jid: rawJid || null,
     push_name: pushName,
-    status_reason: `warming_up_for_${SESSION_READY_AFTER_SECONDS}s`,
+    status_reason: null,
   });
 
   log("connected", { session_key: sessionKey, phone_number: phone || null, wa_jid: rawJid || null });
-  log("session_warming_up", {
+  log("session_ready", {
     session_key: sessionKey,
     phone_number: phone || null,
     wa_jid: rawJid || null,
-    ready_after_seconds: SESSION_READY_AFTER_SECONDS,
+    source: "connection_open",
   });
 
   const row = await getConnectionBySessionKey(sessionKey);
@@ -849,13 +884,12 @@ async function updateConnectedIdentity(sessionKey, sock) {
       phone_number: phone || null,
       wa_jid: rawJid || null,
     });
-    await recordHealthLog(row, "session_warming_up", `warming_up_for_${SESSION_READY_AFTER_SECONDS}s`, {
-      phone_number: phone || null,
-      wa_jid: rawJid || null,
-    });
+    await recordHealthLog(row, "session_ready", "connection_open");
   }
 
-  scheduleReadyCheck(sessionKey, sock, SESSION_READY_AFTER_SECONDS * 1000, "connection_opened");
+  if (READY_CHECK_ON_WHATSAPP) {
+    scheduleReadyCheck(sessionKey, sock, SESSION_READY_AFTER_SECONDS * 1000, "optional_connection_probe");
+  }
 }
 
 async function syncOneSessionIdentity(conn, sock, reason = "periodic_health_sync") {
@@ -992,13 +1026,15 @@ async function promoteSessionIfReady(sessionKey, sock, reason = "ready_check") {
     retry_after_ms: result.retry_after_ms || 15000,
   });
 
-  if (conn && !conn.deleted_at && conn.status !== STATUS_SLEEPING) {
+  // Uma consulta onWhatsApp pode falhar mesmo com o WebSocket aberto. Ela é
+  // somente um probe opcional e nunca rebaixa uma conexão aberta para
+  // "warming_up" ou bloqueia os envios.
+  if (conn && !conn.deleted_at && conn.status !== STATUS_SLEEPING && sock && sock.user) {
     await safeUpdateConn(sessionKey, {
-      status: STATUS_WARMING_UP,
+      status: STATUS_CONNECTED,
       last_seen: nowIso(),
-      status_reason: result.reason,
+      status_reason: null,
     });
-    scheduleReadyCheck(sessionKey, sock, Math.min(Math.max(result.retry_after_ms || 15000, 5000), 120000), result.reason);
   }
 
   return false;
@@ -1052,6 +1088,7 @@ async function markSleeping(sessionKey, reason) {
 
 function scheduleRestart(sessionKey, delayMs, reason) {
   clearRestartTimer(sessionKey);
+  const scheduledGeneration = sessionRuntime.currentGeneration(sessionKey);
 
   const timer = setTimeout(async () => {
     restartTimers.delete(sessionKey);
@@ -1089,6 +1126,7 @@ async function stopSession(
   clearRestartTimer(sessionKey);
   clearReadyTimer(sessionKey);
   resetCounters(sessionKey);
+  await sessionRuntime.flushCredentialWrites(sessionKey);
   sockets.delete(sessionKey);
   starting.delete(sessionKey);
   connectedAt.delete(sessionKey);
@@ -1130,6 +1168,9 @@ async function startSession(sessionKey) {
     return;
   }
 
+  // Eventos do socket anterior são filtrados por geração; uma intenção antiga
+  // não deve cancelar o ciclo legítimo que está começando agora.
+  intentionalStops.delete(sessionKey);
   starting.add(sessionKey);
   clearRestartTimer(sessionKey);
 
@@ -1147,10 +1188,17 @@ async function startSession(sessionKey) {
     if (isQrHandshakeFlow(row)) connectingPatch.qr_base64 = null;
     await safeUpdateConn(sessionKey, connectingPatch);
 
+    // Garante que um restart 515 leia todas as credenciais gravadas pelo
+    // socket anterior antes de abrir o próximo.
+    await sessionRuntime.flushCredentialWrites(sessionKey);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
+    const baileysLogger = createBaileysLogger(sessionKey);
     const socketConfig = {
-      auth: state,
-      logger: createBaileysLogger(sessionKey),
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+      },
+      logger: baileysLogger,
       printQRInTerminal: false,
       syncFullHistory: false,
       fireInitQueries: BAILEYS_FIRE_INIT_QUERIES,
@@ -1167,43 +1215,64 @@ async function startSession(sessionKey) {
         ? Browsers.ubuntu("Chrome")
         : ["Ubuntu", "Chrome", "1.0"],
       getMessage: getMessageForRetry,
+      msgRetryCounterCache: new NodeCache({ stdTTL: 3600, maxKeys: 5000 }),
       shouldSyncHistoryMessage: () => false,
     };
 
-    if (BAILEYS_FETCH_LATEST_VERSION) {
-      const { version } = await fetchLatestBaileysVersion();
+    const version = await getCachedBaileysVersion();
+    if (version) {
       socketConfig.version = version;
       log("baileys_version_selected", { session_key: sessionKey, version });
     }
 
-    const sock = makeWASocket(socketConfig);
+    if (sockets.has(sessionKey) || sessionRuntime.currentGeneration(sessionKey) !== scheduledGeneration) {
+      log("restart_skipped", {
+        session_key: sessionKey,
+        reason: "newer_socket_is_active",
+        scheduled_generation: scheduledGeneration,
+        current_generation: sessionRuntime.currentGeneration(sessionKey),
+      });
+      return;
+    }
 
-    sockets.set(sessionKey, sock);
-    sock.ev.on("creds.update", saveCreds);
+    const sock = makeWASocket(socketConfig);
+    const generation = sessionRuntime.attach(sessionKey, sock);
+
+    sock.ev.on("creds.update", () => {
+      if (!sessionRuntime.isCurrent(sessionKey, sock, generation)) {
+        log("stale_socket_event_ignored", { session_key: sessionKey, generation, event_name: "creds.update" });
+        return;
+      }
+      sessionRuntime.enqueueCredentialWrite(sessionKey, sock, generation, saveCreds).catch((err) => {
+        errorLog("credentials_save_failed", {
+          session_key: sessionKey,
+          generation,
+          error: String(err && err.message ? err.message : err),
+        });
+      });
+    });
     sock.ev.on("messages.update", (updates) => {
+      if (!sessionRuntime.isCurrent(sessionKey, sock, generation)) {
+        log("stale_socket_event_ignored", { session_key: sessionKey, generation, event_name: "messages.update" });
+        return;
+      }
       handleMessagesUpdate(updates).catch((err) => {
-        markUnhealthyFromError(sessionKey, err);
-        registerConnectionError(sessionKey, String(err && err.message ? err.message : err), {
-          source: "messages.update",
-        }).catch(() => {});
         errorLog("messages_update_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
       });
     });
     sock.ev.on("message-receipt.update", (updates) => {
+      if (!sessionRuntime.isCurrent(sessionKey, sock, generation)) {
+        log("stale_socket_event_ignored", { session_key: sessionKey, generation, event_name: "message-receipt.update" });
+        return;
+      }
       handleMessageReceiptUpdate(updates).catch((err) => {
-        markUnhealthyFromError(sessionKey, err);
-        registerConnectionError(sessionKey, String(err && err.message ? err.message : err), {
-          source: "message-receipt.update",
-        }).catch(() => {});
         errorLog("message_receipt_update_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
       });
     });
     sock.ev.on("connection.update", (update) => {
-      handleConnectionUpdate(sessionKey, authPath, sock, update).catch((err) => {
-        markUnhealthyFromError(sessionKey, err);
-        registerConnectionError(sessionKey, String(err && err.message ? err.message : err), {
-          source: "connection.update.handler",
-        }).catch(() => {});
+      sessionRuntime.enqueueSocketEvent(sessionKey, sock, generation, async () => {
+        await handleConnectionUpdate(sessionKey, authPath, sock, generation, update);
+      }).catch((err) => {
         errorLog("connection_update_handler_failed", { session_key: sessionKey, error: String(err && err.message ? err.message : err) });
       });
     });
@@ -1221,7 +1290,11 @@ async function startSession(sessionKey) {
   }
 }
 
-async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
+async function handleConnectionUpdate(sessionKey, authPath, sock, generation, update) {
+  if (!sessionRuntime.isCurrent(sessionKey, sock, generation)) {
+    log("stale_socket_event_ignored", { session_key: sessionKey, generation, event_name: "connection.update" });
+    return;
+  }
   const connection = update && update.connection;
   const qr = update && update.qr;
   const lastDisconnect = update && update.lastDisconnect;
@@ -1235,6 +1308,7 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
     unhealthyUntil.delete(sessionKey);
     unhealthyReason.delete(sessionKey);
     const dataUrl = await qrcode.toDataURL(qr);
+    if (!sessionRuntime.isCurrent(sessionKey, sock, generation)) return;
     await safeUpdateConn(sessionKey, {
       status: "qr_ready",
       qr_base64: dataUrl,
@@ -1256,7 +1330,10 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
 
   if (connection !== "close") return;
 
-  sockets.delete(sessionKey);
+  if (!sessionRuntime.detachIfCurrent(sessionKey, sock, generation)) {
+    log("stale_socket_close_ignored", { session_key: sessionKey, generation, code: code || null });
+    return;
+  }
   starting.delete(sessionKey);
   connectedAt.delete(sessionKey);
   readyAt.delete(sessionKey);
@@ -1384,7 +1461,11 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
       last_seen: nowIso(),
       status_reason: `close_unknown_retry_${attempts}`,
     });
-    scheduleRestart(sessionKey, Math.min(CLOSE_RETRY_MS, 5000), `close_unknown_retry_${attempts}`);
+    scheduleRestart(
+      sessionKey,
+      computeReconnectDelay({ attempt: attempts, baseMs: Math.min(CLOSE_RETRY_MS, 5000), maxMs: 60000 }),
+      `close_unknown_retry_${attempts}`,
+    );
     return;
   }
 
@@ -1432,7 +1513,20 @@ async function handleConnectionUpdate(sessionKey, authPath, sock, update) {
     status_reason: `close_${reason}_retry_${attempts}`,
   });
 
-  scheduleRestart(sessionKey, code === 408 ? QR_RETRY_MS : CLOSE_RETRY_MS, `close_${reason}_retry_${attempts}`);
+  scheduleRestart(
+    sessionKey,
+    computeReconnectDelay({
+      attempt: attempts,
+      baseMs: code === 408 ? QR_RETRY_MS : CLOSE_RETRY_MS,
+      maxMs: 120000,
+    }),
+    `close_${reason}_retry_${attempts}`,
+  );
+}
+
+function isSocketTransportOpen(sock) {
+  if (!sock || !sock.ws) return null;
+  return typeof sock.ws.isOpen === "boolean" ? sock.ws.isOpen : null;
 }
 
 async function handleMessagesUpdate(updates) {
@@ -1710,7 +1804,20 @@ async function syncSessionHealth() {
 
       const sock = sockets.get(conn.session_key);
       if (sock && sock.user) {
-        await promoteSessionIfReady(conn.session_key, sock, "periodic_health_sync");
+        if (isSocketTransportOpen(sock) === false) {
+          const generation = sessionRuntime.currentGeneration(conn.session_key);
+          sessionRuntime.detachIfCurrent(conn.session_key, sock, generation);
+          await safeUpdateConn(conn.session_key, {
+            status: "disconnected",
+            qr_base64: null,
+            last_seen: nowIso(),
+            status_reason: "health_watchdog_closed_transport",
+          });
+          await recordHealthLog(conn, "health_watchdog_restart", "closed_transport");
+          scheduleRestart(conn.session_key, 1000, "health_watchdog_closed_transport");
+          continue;
+        }
+        await syncOneSessionIdentity(conn, sock, "periodic_health_sync");
         continue;
       }
 
@@ -1941,6 +2048,7 @@ function checkConnectionHealth(conn) {
 
   const sock = sockets.get(conn.session_key);
   if (!sock || !sock.user) return { ok: false, reason: "missing_connected_socket" };
+  if (isSocketTransportOpen(sock) === false) return { ok: false, reason: "closed_socket_transport" };
 
   const localConnectedAt = connectedAt.get(conn.session_key);
   const dbConnectedAt = conn.last_connected_at ? Date.parse(conn.last_connected_at) : 0;
@@ -2283,11 +2391,11 @@ async function processOutbox() {
 async function releaseWorkerLock() {
   if (!workerLockAcquired) return;
 
-  const { error } = await supabase.rpc("release_wa_worker_lock", {
+  const { error } = await supabase.rpc("release_wa_worker_lease_v2", {
     p_instance_id: WORKER_INSTANCE_ID,
   });
 
-  if (error && !isMissingRpc(error, "release_wa_worker_lock")) {
+  if (error && !isMissingRpc(error, "release_wa_worker_lease_v2")) {
     warn("worker_lock_release_failed", { instance_id: WORKER_INSTANCE_ID, error: error.message });
   }
 
@@ -2440,31 +2548,41 @@ function handleProcessLevelError(kind, err) {
     error: message.slice(0, 1000),
     stack: stack.slice(0, 2000),
   });
+
+  // Um erro realmente desconhecido pode deixar os mapas e sockets em estado
+  // parcial. Encerrar permite que o Render reinicie o processo de forma limpa,
+  // preservando as credenciais no disco persistente.
+  if (!fatalExitScheduled) {
+    fatalExitScheduled = true;
+    setTimeout(() => process.exit(1), 250);
+  }
 }
 
-process.on("uncaughtException", (err) => {
-  handleProcessLevelError("uncaughtException", err);
-});
+if (SHOULD_BOOTSTRAP) {
+  process.on("uncaughtException", (err) => {
+    handleProcessLevelError("uncaughtException", err);
+  });
 
-process.on("unhandledRejection", (reason) => {
-  handleProcessLevelError("unhandledRejection", reason);
-});
+  process.on("unhandledRejection", (reason) => {
+    handleProcessLevelError("unhandledRejection", reason);
+  });
 
-bootstrap().catch((err) => {
-  errorLog("worker_bootstrap_failed", { error: String(err && err.message ? err.message : err) });
-  process.exit(1);
-});
-
-process.on("SIGINT", () => {
-  shutdown("SIGINT").catch((err) => {
-    errorLog("worker_shutdown_failed", { signal: "SIGINT", error: String(err && err.message ? err.message : err) });
+  bootstrap().catch((err) => {
+    errorLog("worker_bootstrap_failed", { error: String(err && err.message ? err.message : err) });
     process.exit(1);
   });
-});
 
-process.on("SIGTERM", () => {
-  shutdown("SIGTERM").catch((err) => {
-    errorLog("worker_shutdown_failed", { signal: "SIGTERM", error: String(err && err.message ? err.message : err) });
-    process.exit(1);
+  process.on("SIGINT", () => {
+    shutdown("SIGINT").catch((err) => {
+      errorLog("worker_shutdown_failed", { signal: "SIGINT", error: String(err && err.message ? err.message : err) });
+      process.exit(1);
+    });
   });
-});
+
+  process.on("SIGTERM", () => {
+    shutdown("SIGTERM").catch((err) => {
+      errorLog("worker_shutdown_failed", { signal: "SIGTERM", error: String(err && err.message ? err.message : err) });
+      process.exit(1);
+    });
+  });
+}
