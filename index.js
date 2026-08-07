@@ -13,8 +13,135 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { SessionRuntimeRegistry, computeReconnectDelay } from "./lib/session-runtime.js";
-import { sanitizeLogFields } from "./lib/sanitize.js";
+
+// Mantido no mesmo arquivo de propósito: esta edição é preparada para o fluxo
+// do Render/GitHub que publica somente index.js, package.json e package-lock.json.
+class SessionRuntimeRegistry {
+  constructor() {
+    this.sockets = new Map();
+    this.generations = new Map();
+    this.eventQueues = new Map();
+    this.credentialQueues = new Map();
+  }
+
+  attach(sessionKey, socket) {
+    const generation = (this.generations.get(sessionKey) || 0) + 1;
+    this.generations.set(sessionKey, generation);
+    this.sockets.set(sessionKey, socket);
+    return generation;
+  }
+
+  currentGeneration(sessionKey) {
+    return this.generations.get(sessionKey) || 0;
+  }
+
+  isCurrent(sessionKey, socket, generation) {
+    return Boolean(
+      sessionKey &&
+      socket &&
+      this.sockets.get(sessionKey) === socket &&
+      this.currentGeneration(sessionKey) === generation
+    );
+  }
+
+  detachIfCurrent(sessionKey, socket, generation) {
+    if (!this.isCurrent(sessionKey, socket, generation)) return false;
+    this.sockets.delete(sessionKey);
+    return true;
+  }
+
+  async enqueueSocketEvent(sessionKey, socket, generation, task) {
+    if (!this.isCurrent(sessionKey, socket, generation)) return false;
+    const queueKey = `${sessionKey}:${generation}`;
+    const previous = this.eventQueues.get(queueKey) || Promise.resolve();
+    let current;
+    current = previous
+      .catch(() => {})
+      .then(async () => {
+        if (!this.isCurrent(sessionKey, socket, generation)) return false;
+        await task();
+        return true;
+      })
+      .finally(() => {
+        if (this.eventQueues.get(queueKey) === current) this.eventQueues.delete(queueKey);
+      });
+    this.eventQueues.set(queueKey, current);
+    return current;
+  }
+
+  async enqueueCredentialWrite(sessionKey, socket, generation, writer) {
+    if (!this.isCurrent(sessionKey, socket, generation)) return false;
+    const previous = this.credentialQueues.get(sessionKey) || Promise.resolve();
+    let current;
+    current = previous
+      .catch(() => {})
+      .then(async () => {
+        await writer();
+        return true;
+      })
+      .finally(() => {
+        if (this.credentialQueues.get(sessionKey) === current) this.credentialQueues.delete(sessionKey);
+      });
+    this.credentialQueues.set(sessionKey, current);
+    return current;
+  }
+
+  async flushCredentialWrites(sessionKey) {
+    const queue = this.credentialQueues.get(sessionKey);
+    if (queue) await queue.catch(() => {});
+  }
+}
+
+function computeReconnectDelay({
+  attempt = 1,
+  baseMs = 5_000,
+  maxMs = 120_000,
+  jitterRatio = 0.2,
+  random = Math.random,
+} = {}) {
+  const safeAttempt = Math.max(1, Number(attempt) || 1);
+  const safeBase = Math.max(250, Number(baseMs) || 5_000);
+  const safeMax = Math.max(safeBase, Number(maxMs) || 120_000);
+  const exponential = Math.min(safeMax, safeBase * (2 ** (safeAttempt - 1)));
+  const ratio = Math.max(0, Math.min(0.5, Number(jitterRatio) || 0));
+  const unit = Math.max(0, Math.min(1, Number(random()) || 0));
+  const jitter = exponential * ratio * ((unit * 2) - 1);
+  return Math.max(250, Math.round(Math.min(safeMax, exponential + jitter)));
+}
+
+const SECRET_LOG_KEY = /(authorization|cookie|password|secret|service[_-]?role|access[_-]?token|refresh[_-]?token|qr[_-]?base64|private[_-]?key|auth[_-]?state)/i;
+const PERSONAL_LOG_KEY = /^(phone|phone_number|wa_jid|remote_jid|destination|recipient)$/i;
+
+function isSecretLogKey(key) {
+  return SECRET_LOG_KEY.test(key) || /(^|[_-])token($|[_-])/i.test(key);
+}
+
+function scrubLogString(value) {
+  return String(value)
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}/g, "[REDACTED_JWT]")
+    .replace(/([?&](?:token|key|secret|authorization)=)[^&\s]+/gi, "$1[REDACTED]");
+}
+
+function sanitizeLogValue(value, key = "", depth = 0) {
+  if (isSecretLogKey(key) || PERSONAL_LOG_KEY.test(key)) return "[REDACTED]";
+  if (value == null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return scrubLogString(value).slice(0, 2_000);
+  if (depth >= 4) return "[MAX_DEPTH]";
+  if (Array.isArray(value)) return value.slice(0, 50).map((item) => sanitizeLogValue(item, key, depth + 1));
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .slice(0, 100)
+        .map(([childKey, childValue]) => [childKey, sanitizeLogValue(childValue, childKey, depth + 1)]),
+    );
+  }
+  return scrubLogString(value);
+}
+
+function sanitizeLogFields(fields) {
+  return sanitizeLogValue(fields && typeof fields === "object" ? fields : {}, "", 0);
+}
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -69,7 +196,10 @@ const CLEAN_ORPHAN_TOKENS = String(process.env.CLEAN_ORPHAN_TOKENS || "false") =
 const ORPHAN_TOKEN_SCAN_MS = Number(process.env.ORPHAN_TOKEN_SCAN_MS || 300000);
 const MAX_SESSION_STARTS_PER_REFRESH = Number(process.env.MAX_SESSION_STARTS_PER_REFRESH || 3);
 const SESSION_START_SPACING_MS = Number(process.env.SESSION_START_SPACING_MS || 1500);
-const SKIP_OLD_DISCONNECTED_SESSIONS = String(process.env.SKIP_OLD_DISCONNECTED_SESSIONS || "true") === "true";
+// Uma conexao desconectada precisa voltar a gerar QR mesmo quando ficou dias sem atividade.
+// O valor antigo (true) fazia o worker ignorar silenciosamente conexoes antigas.
+const SKIP_OLD_DISCONNECTED_SESSIONS = String(process.env.SKIP_OLD_DISCONNECTED_SESSIONS || "false") === "true";
+const AUTO_RECONNECT_DISCONNECTED_SESSIONS = String(process.env.AUTO_RECONNECT_DISCONNECTED_SESSIONS || "true") === "true";
 const OLD_DISCONNECTED_MAX_AGE_MINUTES = Number(process.env.OLD_DISCONNECTED_MAX_AGE_MINUTES || 15);
 const FORCE_REFRESH_STALE_QR = String(process.env.FORCE_REFRESH_STALE_QR || "true") === "true";
 const QR_STALE_REFRESH_MINUTES = Number(process.env.QR_STALE_REFRESH_MINUTES || 2);
@@ -1653,10 +1783,21 @@ function connectionStartPriority(connection) {
 
 function shouldStartConnection(connection) {
   if (!connection || !connection.session_key || connection.deleted_at) return false;
-  if (!SKIP_OLD_DISCONNECTED_SESSIONS) return true;
   if (sockets.has(connection.session_key) || starting.has(connection.session_key)) return true;
 
   const status = String(connection.status || "");
+
+  // "logged_out" e uma solicitacao explicita de novo QR feita pela interface.
+  // Nunca deve ser bloqueada pela idade do last_seen.
+  if (status === "logged_out") return true;
+
+  // Conexoes desconectadas devem se recuperar sem depender de last_seen recente.
+  // Isto tambem neutraliza uma env antiga SKIP_OLD_DISCONNECTED_SESSIONS=true
+  // que ainda possa existir no Render.
+  if (status === "disconnected" && AUTO_RECONNECT_DISCONNECTED_SESSIONS) return true;
+
+  if (!SKIP_OLD_DISCONNECTED_SESSIONS) return true;
+
   const mayBeManualQrFlow = new Set(["logged_out", "qr_ready", "connecting", "disconnected", "error"]);
   if (!mayBeManualQrFlow.has(status)) return true;
 
@@ -2421,10 +2562,48 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
+async function markWorkerBootstrapFailure(reason) {
+  const safeReason = String(reason || "worker_bootstrap_failed").slice(0, 180);
+
+  try {
+    const { error } = await supabase
+      .from("wa_connections")
+      .update({
+        status: "error",
+        qr_base64: null,
+        last_seen: nowIso(),
+        status_reason: safeReason,
+      })
+      .is("deleted_at", null)
+      .in("status", ["disconnected", "logged_out", "connecting", "qr_ready", "error"]);
+
+    if (error) {
+      errorLog("worker_bootstrap_failure_status_update_failed", {
+        reason: safeReason,
+        error: error.message,
+      });
+    }
+  } catch (err) {
+    errorLog("worker_bootstrap_failure_status_update_exception", {
+      reason: safeReason,
+      error: String(err && err.message ? err.message : err),
+    });
+  }
+}
+
 async function bootstrap() {
-  ensureDir(path.join(TOKENS_BASE_DIR, TOKENS_FOLDER));
+  const authRoot = path.join(TOKENS_BASE_DIR, TOKENS_FOLDER);
+
+  try {
+    ensureDir(authRoot);
+    fs.accessSync(authRoot, fs.constants.R_OK | fs.constants.W_OK);
+  } catch (err) {
+    await markWorkerBootstrapFailure("worker_storage_not_writable");
+    throw new Error(`worker_storage_not_writable:${String(err && err.message ? err.message : err)}`);
+  }
 
   log("worker_started", {
+    worker_build: "v7-flat-20260807",
     tokens_base_dir: TOKENS_BASE_DIR,
     tokens_folder: TOKENS_FOLDER,
     worker_instance_id: WORKER_INSTANCE_ID,
@@ -2474,6 +2653,7 @@ async function bootstrap() {
     max_session_starts_per_refresh: MAX_SESSION_STARTS_PER_REFRESH,
     session_start_spacing_ms: SESSION_START_SPACING_MS,
     skip_old_disconnected_sessions: SKIP_OLD_DISCONNECTED_SESSIONS,
+    auto_reconnect_disconnected_sessions: AUTO_RECONNECT_DISCONNECTED_SESSIONS,
     old_disconnected_max_age_minutes: OLD_DISCONNECTED_MAX_AGE_MINUTES,
     force_refresh_stale_qr: FORCE_REFRESH_STALE_QR,
     qr_stale_refresh_minutes: QR_STALE_REFRESH_MINUTES,
@@ -2484,6 +2664,19 @@ async function bootstrap() {
     conflict_replaced_backoff_ms: CONFLICT_REPLACED_BACKOFF_MS,
     conflict_replaced_max_restarts: CONFLICT_REPLACED_MAX_RESTARTS,
   });
+
+  const initialLock = await ensureWorkerLock();
+  if (!initialLock && WORKER_LOCK_REQUIRED && !workerLockRpcAvailable) {
+    await markWorkerBootstrapFailure("worker_lock_migration_missing");
+    throw new Error("worker_lock_migration_missing: aplique a migration 202608060002_wa_worker_single_owner_lease.sql");
+  }
+
+  if (!initialLock) {
+    warn("worker_waiting_for_active_lease", {
+      instance_id: WORKER_INSTANCE_ID,
+      worker_lock_required: WORKER_LOCK_REQUIRED,
+    });
+  }
 
   await refreshSessions();
   await syncSessionHealth();
@@ -2586,3 +2779,10 @@ if (SHOULD_BOOTSTRAP) {
     });
   });
 }
+
+export {
+  SessionRuntimeRegistry,
+  computeReconnectDelay,
+  sanitizeLogFields,
+  shouldStartConnection,
+};
